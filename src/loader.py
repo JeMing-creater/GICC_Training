@@ -1,4 +1,5 @@
 import os
+from sympy import im
 import yaml
 import pandas as pd
 import numpy as np
@@ -305,6 +306,10 @@ def get_loaders(cfg):
     
     if len(train_list) == 0: raise ValueError("训练集为空")
 
+    train_ds = SafeDataset(data=train_list, transform=get_transforms(cfg, "train"))
+    
+    val_ds = SafeDataset(data=dg_valid, transform=get_transforms(cfg, "val")) 
+    
     train_ds = SafeDataset(data=train_list, transform=get_transforms(cfg, "train"))
     val_ds = SafeDataset(data=dg_valid, transform=get_transforms(cfg, "val")) 
 
