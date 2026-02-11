@@ -87,29 +87,53 @@ class CheckAndFixDimensionsd(MapTransform):
 
 class SafeDataset(MonaiDataset):
     """
-    【安全 Dataset】
-    捕获所有 Transform 中的错误，返回 None。
+    【安全 Dataset - DDP 友好版】
+    绝不返回 None（DDP 下任何 rank 少一步都会 NCCL timeout）。
+    遇到异常时，自动尝试其它 index，最多 retry 次数。
+    如果连续失败，抛出异常（宁可早失败，也不要训练中 NCCL hang）。
     """
+    def __init__(self, *args, max_retry: int = 30, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_retry = int(max_retry)
+
     def __getitem__(self, index):
-        try:
-            return super().__getitem__(index)
-        except Exception as e:
-            sample_info = self.data[index]
-            sample_id = sample_info.get('id', 'Unknown')
-            # 打印简短的错误日志
-            print(f"\n❌ [Read Error] 跳过样本 ID: {sample_id}")
-            print(f"   原因: {str(e)}")
-            return None
+        last_e = None
+        n = len(self.data)
+
+        # 以 index 为起点，线性探测后续样本，最多 max_retry 次
+        for k in range(self.max_retry):
+            idx = (index + k) % n
+            try:
+                return super().__getitem__(idx)
+            except Exception as e:
+                last_e = e
+                sample_info = self.data[idx]
+                sample_id = sample_info.get("id", "Unknown")
+                # 建议不要 print 太多（多卡会刷屏）；只在极少数时打印
+                if k == 0:
+                    print(f"\n❌ [Read Error] idx={idx} ID={sample_id} | {str(e)}")
+                continue
+
+        raise RuntimeError(
+            f"[SafeDataset] Failed to fetch a valid sample after {self.max_retry} retries. "
+            f"Last error: {str(last_e)}"
+        )
+
+
 
 def collate_fn_ignore_none(batch):
     """
-    【安全 Collate】过滤 None
+    【DDP 友好 Collate】
+    训练时不允许返回 None（否则不同 rank step 数不一致 -> NCCL hang）。
+    如果 batch 里出现 None，直接过滤；若过滤后为空，抛异常快速暴露问题。
     """
     batch = [x for x in batch if x is not None]
     if len(batch) == 0:
-        return None
+        raise RuntimeError("[collate_fn_ignore_none] Empty batch after filtering None. "
+                           "This will break DDP. Please check dataset/transform errors.")
     from monai.data import list_data_collate
     return list_data_collate(batch)
+
 
 # ==========================================
 # 3. 路径查找与 ID 匹配逻辑
@@ -292,7 +316,7 @@ def get_loaders(cfg):
     root_dir = cfg.root_dir
     req_mods = cfg.use_modalities
     leapfrog_list = cfg.get("leapfrog", [])
-    
+
     print(f"🚀 初始化 Loader | 目标尺寸: {cfg.target_size}")
 
     mei_valid, mei_fail = build_data_list(cfg.excel_configs.mei, root_dir, leapfrog_list, "All", req_mods, "Mei")
@@ -303,31 +327,42 @@ def get_loaders(cfg):
 
     dg_valid, dg_fail = build_data_list(cfg.excel_configs.dg, root_dir, leapfrog_list, "All", req_mods, "DG")
     print_report("Val Set", dg_valid, dg_fail)
-    
-    if len(train_list) == 0: raise ValueError("训练集为空")
 
-    train_ds = SafeDataset(data=train_list, transform=get_transforms(cfg, "train"))
-    
-    val_ds = SafeDataset(data=dg_valid, transform=get_transforms(cfg, "val")) 
-    
-    train_ds = SafeDataset(data=train_list, transform=get_transforms(cfg, "train"))
-    val_ds = SafeDataset(data=dg_valid, transform=get_transforms(cfg, "val")) 
+    if len(train_list) == 0:
+        raise ValueError("训练集为空")
+    if len(dg_valid) == 0:
+        raise ValueError("验证集为空")
 
-    # 创建原始 Loader
-    _train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True, 
-        num_workers=cfg.num_workers, collate_fn=collate_fn_ignore_none
+    # ✅ DDP 友好：Dataset 不返回 None；collate 不返回 None
+    train_ds = SafeDataset(data=train_list, transform=get_transforms(cfg, "train"), max_retry=30)
+    val_ds = SafeDataset(data=dg_valid, transform=get_transforms(cfg, "val"), max_retry=30)
+
+    pin_memory = bool(getattr(cfg, "pin_memory", True))
+    num_workers = int(getattr(cfg, "num_workers", 4))
+
+    # ✅ 关键：不要再包 NonEmptyDataLoader（会导致不同 rank step 数不同）
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(cfg.batch_size),
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn_ignore_none,
+        drop_last=True,   # ✅ 多卡训练更稳：每个 rank step 数一致
     )
-    _val_loader = DataLoader(
-        val_ds, batch_size=1, shuffle=False, 
-        num_workers=cfg.num_workers, collate_fn=collate_fn_ignore_none
-    )
 
-    # 【核心】包裹一层 NonEmptyDataLoader
-    train_loader = NonEmptyDataLoader(_train_loader)
-    val_loader = NonEmptyDataLoader(_val_loader)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn_ignore_none,
+        drop_last=True,   # ✅ 多卡验证也建议 True，避免最后一个不齐导致通信差异
+    )
 
     return train_loader, val_loader
+
 
 # ==========================================
 # 6. 调试/诊断工具

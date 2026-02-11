@@ -42,11 +42,11 @@ def train_one_epoch(
     epoch: int,
     cfg: Any,
 ) -> Dict[str, float]:
-    from tqdm import tqdm  # 放函数里，避免你 requirements 未装时 import 报错
+    from tqdm import tqdm
 
     model.train()
 
-    recon_weight = float(cfg.train.recon_weight)  # 必须 >0，确保 Et/G 有梯度（多卡不炸）
+    recon_weight = float(cfg.train.recon_weight)
     inv_weight = float(getattr(cfg.train, "inv_weight", 0.0))
     grad_clip = float(getattr(cfg.train, "grad_clip", 0.0))
     log_interval = int(getattr(cfg.logging, "log_interval", 20))
@@ -54,18 +54,17 @@ def train_one_epoch(
     act = Activations(sigmoid=True)
     to_bin = AsDiscrete(threshold=0.5)
 
-    # ✅ 只评估 foreground（避免 class 0 背景通道触发 all-0 警告）
     dice_metric = DiceMetric(include_background=False, reduction="mean")
     hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
 
     running = {"loss": 0.0, "loss_seg": 0.0, "loss_recon": 0.0, "dice": 0.0, "hd95": 0.0}
     n_steps = 0
+    hd_steps = 0  # 记录 hd95 有效步数
 
     out_ch = int(getattr(cfg.model, "out_ch", 1))
     take_first = bool(getattr(cfg.data, "label_take_first_channel", True))
     device = accelerator.device
 
-    # ✅ 主进程显示进度条，多卡其他进程禁用
     pbar = tqdm(
         enumerate(train_loader),
         total=len(train_loader) if hasattr(train_loader, "__len__") else None,
@@ -75,13 +74,48 @@ def train_one_epoch(
     )
 
     for step, batch in pbar:
+        # -------------------------
+        # 1) 同步判定本 step 是否有效（任何 rank 无效 -> 全体跳过）
+        # -------------------------
+        local_bad = 0
         if batch is None:
+            local_bad = 1
+        else:
+            # 有些情况下 batch 不是 None，但缺 key / 类型不对
+            if not isinstance(batch, dict) or ("image" not in batch) or ("seg_label" not in batch):
+                local_bad = 1
+
+        bad = torch.tensor([local_bad], device=device, dtype=torch.int32)
+        bad_sum = accelerator.reduce(bad, reduction="sum")  # 所有 rank 都会走到这里
+        if int(bad_sum.item()) > 0:
+            # ✅ 全体同步跳过这个 step，避免有的 backward 有的没 backward
+            optimizer.zero_grad(set_to_none=True)
+            if accelerator.is_main_process:
+                pbar.set_postfix(skip="bad_batch")
             continue
 
-        x = batch["image"].to(device, non_blocking=True)
-        y = batch["seg_label"].to(device, non_blocking=True)
-        y = select_label_channel(y, out_ch=out_ch, take_first=take_first)
+        # -------------------------
+        # 2) 安全搬运到 device（如果搬运失败也要同步跳过）
+        # -------------------------
+        try:
+            x = batch["image"].to(device, non_blocking=True)
+            y = batch["seg_label"].to(device, non_blocking=True)
+            y = select_label_channel(y, out_ch=out_ch, take_first=take_first)
+            local_bad2 = 0
+        except Exception:
+            local_bad2 = 1
 
+        bad2 = torch.tensor([local_bad2], device=device, dtype=torch.int32)
+        bad2_sum = accelerator.reduce(bad2, reduction="sum")
+        if int(bad2_sum.item()) > 0:
+            optimizer.zero_grad(set_to_none=True)
+            if accelerator.is_main_process:
+                pbar.set_postfix(skip="to(device)_fail")
+            continue
+
+        # -------------------------
+        # 3) 正常训练 step（所有 rank 一致执行）
+        # -------------------------
         with accelerator.accumulate(model):
             with accelerator.autocast():
                 out = model(x)
@@ -104,32 +138,23 @@ def train_one_epoch(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # ---- Metrics（安全版：对空前景样本跳过 HD95）----
+        # -------------------------
+        # 4) Metrics（本地计算，不做 gather；tqdm 显示心跳）
+        # -------------------------
         with torch.no_grad():
             prob = act(out.logits)
             pred = to_bin(prob)
 
-            # Dice：MONAI metric 本身可算（即使空，也通常定义为 1 或 0，取决于实现）
             dice_metric(pred, y)
             dice_val = dice_metric.aggregate().detach()
             dice_metric.reset()
 
-            # HD95：如果 pred 或 gt 没前景，Hausdorff 不定义 -> 跳过本 batch 的 hd95（记为 NaN）
-            # 这里用 batch 级逻辑：只要 batch 内每个样本都检查，避免 MONAI 内部 warning
-            # (pred,y) 是 [B,1,H,W,D] 或 [B,K,...]；我们只看前景通道总和
-            # 对二分类 out_ch=1：前景就是 channel 0
-            pred_fg = pred
-            y_fg = y
-            # 若是多类，你可改为 pred[:,1:] / y[:,1:]（不含背景）
-
-            # per-sample foreground existence
-            pred_has = (pred_fg.sum(dim=(1, 2, 3, 4)) > 0)
-            gt_has = (y_fg.sum(dim=(1, 2, 3, 4)) > 0)
+            pred_has = (pred.sum(dim=(1, 2, 3, 4)) > 0)
+            gt_has = (y.sum(dim=(1, 2, 3, 4)) > 0)
             valid = pred_has & gt_has
 
             if valid.any():
-                # 只对 valid 的样本计算 hd95，避免 warning
-                hd95_metric(pred_fg[valid], y_fg[valid])
+                hd95_metric(pred[valid], y[valid])
                 hd95_val = hd95_metric.aggregate().detach()
                 hd95_metric.reset()
             else:
@@ -139,16 +164,15 @@ def train_one_epoch(
         running["loss_seg"] += float(loss_pack["loss_seg"].item())
         running["loss_recon"] += float(loss_pack["loss_recon"].item())
         running["dice"] += float(dice_val.item())
-        # hd95 用 nan-aware：如果本步是 nan，不加到 running（否则均值被污染）
         if torch.isfinite(hd95_val):
             running["hd95"] += float(hd95_val.item())
+            hd_steps += 1
+
         n_steps += 1
 
-        # tqdm 显示当前均值（让你确认每个 epoch 正常跑）
         if accelerator.is_main_process:
             avg_loss = running["loss"] / max(n_steps, 1)
             avg_dice = running["dice"] / max(n_steps, 1)
-            # hd95 的均值按“有效步数”统计
             pbar.set_postfix(loss=f"{avg_loss:.4f}", dice=f"{avg_dice:.4f}")
 
         if accelerator.is_main_process and (step % log_interval == 0):
@@ -158,8 +182,7 @@ def train_one_epoch(
                     "train/loss_seg": running["loss_seg"] / max(n_steps, 1),
                     "train/loss_recon": running["loss_recon"] / max(n_steps, 1),
                     "train/dice": running["dice"] / max(n_steps, 1),
-                    # hd95 如果很多步无效，这里是“仅累计有效步”的粗略均值
-                    "train/hd95": running["hd95"] / max(1, sum([1 for _ in range(0)]) + 1),  # 占位：下面统一返回时再算
+                    "train/hd95": running["hd95"] / max(hd_steps, 1),
                     "epoch": epoch,
                 },
                 step=epoch * 100000 + step,
@@ -168,14 +191,12 @@ def train_one_epoch(
     if n_steps == 0:
         return {"loss": 0.0, "loss_seg": 0.0, "loss_recon": 0.0, "dice": 0.0, "hd95": 0.0}
 
-    # 训练返回：hd95 这里给“累计有效步的均值”，更严谨可在上面单独统计 valid_steps
-    # 简洁起见：若你希望更严谨，我可以再给一个精确版本（统计 valid_steps）
     return {
         "loss": running["loss"] / n_steps,
         "loss_seg": running["loss_seg"] / n_steps,
         "loss_recon": running["loss_recon"] / n_steps,
         "dice": running["dice"] / n_steps,
-        "hd95": running["hd95"] / max(1, n_steps),  # 简化；严格版见你下一句我就给
+        "hd95": running["hd95"] / max(hd_steps, 1),
     }
 
 
@@ -191,20 +212,20 @@ def val_one_epoch(
     from tqdm import tqdm
 
     model.eval()
-
     act = Activations(sigmoid=True)
     to_bin = AsDiscrete(threshold=0.5)
 
-    # ✅ foreground only
-    dice_metric = DiceMetric(include_background=False, reduction="none")
-    hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="none")
-
-    dice_vals = []
-    hd95_vals = []
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
 
     out_ch = int(getattr(cfg.model, "out_ch", 1))
     take_first = bool(getattr(cfg.data, "label_take_first_channel", True))
     device = accelerator.device
+
+    dice_sum = torch.tensor(0.0, device=device)
+    dice_cnt = torch.tensor(0.0, device=device)
+    hd95_sum = torch.tensor(0.0, device=device)
+    hd95_cnt = torch.tensor(0.0, device=device)
 
     pbar = tqdm(
         enumerate(val_loader),
@@ -215,12 +236,34 @@ def val_one_epoch(
     )
 
     for step, batch in pbar:
+        local_bad = 0
         if batch is None:
+            local_bad = 1
+        else:
+            if not isinstance(batch, dict) or ("image" not in batch) or ("seg_label" not in batch):
+                local_bad = 1
+
+        bad = torch.tensor([local_bad], device=device, dtype=torch.int32)
+        bad_sum = accelerator.reduce(bad, reduction="sum")
+        if int(bad_sum.item()) > 0:
+            if accelerator.is_main_process:
+                pbar.set_postfix(skip="bad_batch")
             continue
 
-        x = batch["image"].to(device, non_blocking=True)
-        y = batch["seg_label"].to(device, non_blocking=True)
-        y = select_label_channel(y, out_ch=out_ch, take_first=take_first)
+        try:
+            x = batch["image"].to(device, non_blocking=True)
+            y = batch["seg_label"].to(device, non_blocking=True)
+            y = select_label_channel(y, out_ch=out_ch, take_first=take_first)
+            local_bad2 = 0
+        except Exception:
+            local_bad2 = 1
+
+        bad2 = torch.tensor([local_bad2], device=device, dtype=torch.int32)
+        bad2_sum = accelerator.reduce(bad2, reduction="sum")
+        if int(bad2_sum.item()) > 0:
+            if accelerator.is_main_process:
+                pbar.set_postfix(skip="to(device)_fail")
+            continue
 
         with accelerator.autocast():
             out = model(x)
@@ -228,52 +271,41 @@ def val_one_epoch(
         prob = act(out.logits)
         pred = to_bin(prob)
 
-        # Dice per-sample
         dice_metric(pred, y)
-        d = dice_metric.aggregate()
+        d = dice_metric.aggregate().detach()
         dice_metric.reset()
+        if torch.isfinite(d):
+            dice_sum += d
+            dice_cnt += 1.0
 
-        # HD95：只对 pred&gt 均有前景的样本计算，避免 warning
         pred_has = (pred.sum(dim=(1, 2, 3, 4)) > 0)
         gt_has = (y.sum(dim=(1, 2, 3, 4)) > 0)
         valid = pred_has & gt_has
-
         if valid.any():
             hd95_metric(pred[valid], y[valid])
-            h = hd95_metric.aggregate()
+            h = hd95_metric.aggregate().detach()
             hd95_metric.reset()
-            # 把无效样本补 NaN，保持 batch size 对齐（便于汇总/统计）
-            h_full = torch.full((pred.shape[0],), float("nan"), device=device)
-            h_full[valid] = h.flatten()
-        else:
-            h_full = torch.full((pred.shape[0],), float("nan"), device=device)
-
-        # 多卡汇总
-        d_g = accelerator.gather_for_metrics(d).flatten()
-        h_g = accelerator.gather_for_metrics(h_full).flatten()
-
-        dice_vals.append(d_g)
-        hd95_vals.append(h_g)
+            if torch.isfinite(h):
+                hd95_sum += h
+                hd95_cnt += 1.0
 
         if accelerator.is_main_process:
-            # tqdm 上显示当前累计均值（nanmean 忽略无效 hd95）
-            dice_now = torch.nanmean(torch.cat(dice_vals)).item()
-            hd95_now = torch.nanmean(torch.cat(hd95_vals)).item()
+            dice_now = (dice_sum / dice_cnt).item() if dice_cnt.item() > 0 else 0.0
+            hd95_now = (hd95_sum / hd95_cnt).item() if hd95_cnt.item() > 0 else 0.0
             pbar.set_postfix(dice=f"{dice_now:.4f}", hd95=f"{hd95_now:.3f}")
 
-    if len(dice_vals) == 0:
-        stats = {"dice": 0.0, "hd95": 0.0}
-    else:
-        dice_all = torch.cat(dice_vals, dim=0)
-        hd95_all = torch.cat(hd95_vals, dim=0)
-        stats = {
-            "dice": float(torch.nanmean(dice_all).item()),
-            "hd95": float(torch.nanmean(hd95_all).item()),
-        }
+    # 全局 reduce（一次）
+    dice_sum_g = accelerator.reduce(dice_sum, reduction="sum")
+    dice_cnt_g = accelerator.reduce(dice_cnt, reduction="sum")
+    hd95_sum_g = accelerator.reduce(hd95_sum, reduction="sum")
+    hd95_cnt_g = accelerator.reduce(hd95_cnt, reduction="sum")
 
+    dice_mean = (dice_sum_g / dice_cnt_g).item() if dice_cnt_g.item() > 0 else 0.0
+    hd95_mean = (hd95_sum_g / hd95_cnt_g).item() if hd95_cnt_g.item() > 0 else 0.0
+
+    stats = {"dice": float(dice_mean), "hd95": float(hd95_mean)}
     if accelerator.is_main_process:
         accelerator.log({"val/dice": stats["dice"], "val/hd95": stats["hd95"], "epoch": epoch}, step=epoch)
-
     return stats
 
 
