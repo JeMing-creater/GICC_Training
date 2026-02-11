@@ -1,0 +1,83 @@
+train:
+  seed: 42
+  epochs: 200
+  lr: 0.0002
+  min_lr: 0.000001
+  weight_decay: 0.0001
+  scheduler: "cosine"
+
+  # accelerate
+  grad_accum_steps: 1
+  grad_clip: 0.0
+
+  # DG 范式损失权重（关键：recon_weight>0 才能确保多卡下 Et/G 也参与反传）
+  recon_weight: 0.1
+  inv_weight: 0.0
+
+checkpoint:
+  resume: true
+  latest_dirname: "latest"
+  best_filename: "best.pth"
+
+  # 可选：如果你想从某个权重初始化（比如预训练或别的run的best）
+  # 留空则不加载
+  init_weights_path: ""
+
+accelerate:
+  # "no" | "fp16" | "bf16"
+  mixed_precision: "bf16"
+
+logging:
+  project_name: "colon_mri_dg_seg"
+  # log 根目录（与 main.py 同级）
+  log_root: "log"
+  # 留空则自动用时间戳
+  run_name: ""
+  timezone: "Asia/Seoul"
+  log_interval: 20
+
+model:
+  # 二分类分割输出 1 通道
+  out_ch: 1
+
+  # 结构-风格因子化 DG 分割模型超参（与你已收到的 model/entry.py 对齐）
+  base_ch: 32
+  depth: 4
+  style_dim: 128
+  norm: "instance"
+  dropout: 0.0
+
+data:
+  # 服务器上的根目录
+  root_dir: "/mnt/liangjm/GICC/"
+
+  # Excel配置
+  excel_configs:
+    mei:
+      filename: "Mei.xlsx"
+      id_col_index: 0
+    gz:
+      filename: "GZ.xlsx"
+      id_col_index: 3
+    dg:
+      filename: "DG.xlsx"
+      id_col_index: 1
+
+  # 模态选择（决定输入通道数）
+  use_modalities: ["T2_FS", "V"]
+
+  # 统一尺寸（与你 loader 一致）
+  target_size: [256, 256, 32]
+
+  # 黑名单/跳过列表
+  leapfrog: ["101770","91595","126104","66238", "90626", "91458","114821","103174","65716","101770"]
+
+  # DataLoader
+  batch_size: 2
+  num_workers: 8
+  pin_memory: true
+
+  # 你的 label 可能是 [B,C,...]（按模态 concat），out_ch=1 时默认取第一个通道
+  label_take_first_channel: true
+
+
