@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict
 
@@ -26,6 +27,7 @@ from src.utils import (
     save_best_weights_if_improved,
     maybe_resume_from_latest,
     load_weights,
+    start_txt_logger,   # ✅ 新增：rank0 写 console.txt
 )
 
 from model import build_model
@@ -43,6 +45,7 @@ def train_one_epoch(
     cfg: Any,
 ) -> Dict[str, float]:
     from tqdm import tqdm
+    import time
 
     model.train()
 
@@ -50,6 +53,7 @@ def train_one_epoch(
     inv_weight = float(getattr(cfg.train, "inv_weight", 0.0))
     grad_clip = float(getattr(cfg.train, "grad_clip", 0.0))
     log_interval = int(getattr(cfg.logging, "log_interval", 20))
+    step_timeout = float(getattr(cfg.train, "step_timeout_sec", 0.0))  # ✅ 只用 train 字段
 
     act = Activations(sigmoid=True)
     to_bin = AsDiscrete(threshold=0.5)
@@ -59,7 +63,7 @@ def train_one_epoch(
 
     running = {"loss": 0.0, "loss_seg": 0.0, "loss_recon": 0.0, "dice": 0.0, "hd95": 0.0}
     n_steps = 0
-    hd_steps = 0  # 记录 hd95 有效步数
+    hd_steps = 0
 
     out_ch = int(getattr(cfg.model, "out_ch", 1))
     take_first = bool(getattr(cfg.data, "label_take_first_channel", True))
@@ -74,29 +78,21 @@ def train_one_epoch(
     )
 
     for step, batch in pbar:
-        # -------------------------
-        # 1) 同步判定本 step 是否有效（任何 rank 无效 -> 全体跳过）
-        # -------------------------
-        local_bad = 0
-        if batch is None:
-            local_bad = 1
-        else:
-            # 有些情况下 batch 不是 None，但缺 key / 类型不对
-            if not isinstance(batch, dict) or ("image" not in batch) or ("seg_label" not in batch):
-                local_bad = 1
+        step_t0 = time.time()
 
+        # --- 同步 bad batch 判定（所有 rank 一致跳过）---
+        local_bad = 0
+        if batch is None or (not isinstance(batch, dict)) or ("image" not in batch) or ("seg_label" not in batch):
+            local_bad = 1
         bad = torch.tensor([local_bad], device=device, dtype=torch.int32)
-        bad_sum = accelerator.reduce(bad, reduction="sum")  # 所有 rank 都会走到这里
+        bad_sum = accelerator.reduce(bad, reduction="sum")
         if int(bad_sum.item()) > 0:
-            # ✅ 全体同步跳过这个 step，避免有的 backward 有的没 backward
             optimizer.zero_grad(set_to_none=True)
             if accelerator.is_main_process:
                 pbar.set_postfix(skip="bad_batch")
             continue
 
-        # -------------------------
-        # 2) 安全搬运到 device（如果搬运失败也要同步跳过）
-        # -------------------------
+        # --- to(device) 同步判定 ---
         try:
             x = batch["image"].to(device, non_blocking=True)
             y = batch["seg_label"].to(device, non_blocking=True)
@@ -113,9 +109,8 @@ def train_one_epoch(
                 pbar.set_postfix(skip="to(device)_fail")
             continue
 
-        # -------------------------
-        # 3) 正常训练 step（所有 rank 一致执行）
-        # -------------------------
+        # --- forward/backward 计时 ---
+        t_fw0 = time.time()
         with accelerator.accumulate(model):
             with accelerator.autocast():
                 out = model(x)
@@ -137,10 +132,10 @@ def train_one_epoch(
 
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+        t_fw1 = time.time()
 
-        # -------------------------
-        # 4) Metrics（本地计算，不做 gather；tqdm 显示心跳）
-        # -------------------------
+        # --- metrics 计时 ---
+        t_m0 = time.time()
         with torch.no_grad():
             prob = act(out.logits)
             pred = to_bin(prob)
@@ -152,14 +147,26 @@ def train_one_epoch(
             pred_has = (pred.sum(dim=(1, 2, 3, 4)) > 0)
             gt_has = (y.sum(dim=(1, 2, 3, 4)) > 0)
             valid = pred_has & gt_has
-
             if valid.any():
                 hd95_metric(pred[valid], y[valid])
                 hd95_val = hd95_metric.aggregate().detach()
                 hd95_metric.reset()
             else:
                 hd95_val = torch.tensor(float("nan"), device=device)
+        t_m1 = time.time()
 
+        # --- 超时同步：所有 rank 一起跳过/继续 ---
+        step_dt = time.time() - step_t0
+        local_timeout = 1 if (step_timeout > 0 and step_dt > step_timeout) else 0
+        timeout = torch.tensor([local_timeout], device=device, dtype=torch.int32)
+        timeout_sum = accelerator.reduce(timeout, reduction="sum")
+        if int(timeout_sum.item()) > 0:
+            optimizer.zero_grad(set_to_none=True)
+            if accelerator.is_main_process:
+                pbar.set_postfix(skip=f"timeout({step_dt:.1f}s)", fw=f"{t_fw1-t_fw0:.1f}s", met=f"{t_m1-t_m0:.1f}s")
+            continue
+
+        # --- 正常统计 ---
         running["loss"] += float(loss.detach().item())
         running["loss_seg"] += float(loss_pack["loss_seg"].item())
         running["loss_recon"] += float(loss_pack["loss_recon"].item())
@@ -173,7 +180,7 @@ def train_one_epoch(
         if accelerator.is_main_process:
             avg_loss = running["loss"] / max(n_steps, 1)
             avg_dice = running["dice"] / max(n_steps, 1)
-            pbar.set_postfix(loss=f"{avg_loss:.4f}", dice=f"{avg_dice:.4f}")
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", dice=f"{avg_dice:.4f}", fw=f"{t_fw1-t_fw0:.1f}s", met=f"{t_m1-t_m0:.1f}s")
 
         if accelerator.is_main_process and (step % log_interval == 0):
             accelerator.log(
@@ -183,6 +190,9 @@ def train_one_epoch(
                     "train/loss_recon": running["loss_recon"] / max(n_steps, 1),
                     "train/dice": running["dice"] / max(n_steps, 1),
                     "train/hd95": running["hd95"] / max(hd_steps, 1),
+                    "train/step_time": step_dt,
+                    "train/fw_time": (t_fw1 - t_fw0),
+                    "train/metric_time": (t_m1 - t_m0),
                     "epoch": epoch,
                 },
                 step=epoch * 100000 + step,
@@ -210,6 +220,7 @@ def val_one_epoch(
     cfg: Any,
 ) -> Dict[str, float]:
     from tqdm import tqdm
+    import time
 
     model.eval()
     act = Activations(sigmoid=True)
@@ -217,6 +228,8 @@ def val_one_epoch(
 
     dice_metric = DiceMetric(include_background=False, reduction="mean")
     hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+
+    step_timeout = float(getattr(cfg.train, "step_timeout_sec", 0.0))  # ✅ 只用 train 字段
 
     out_ch = int(getattr(cfg.model, "out_ch", 1))
     take_first = bool(getattr(cfg.data, "label_take_first_channel", True))
@@ -236,47 +249,27 @@ def val_one_epoch(
     )
 
     for step, batch in pbar:
-        local_bad = 0
-        if batch is None:
-            local_bad = 1
-        else:
-            if not isinstance(batch, dict) or ("image" not in batch) or ("seg_label" not in batch):
-                local_bad = 1
+        step_t0 = time.time()
 
-        bad = torch.tensor([local_bad], device=device, dtype=torch.int32)
-        bad_sum = accelerator.reduce(bad, reduction="sum")
-        if int(bad_sum.item()) > 0:
-            if accelerator.is_main_process:
-                pbar.set_postfix(skip="bad_batch")
+        if batch is None or (not isinstance(batch, dict)) or ("image" not in batch) or ("seg_label" not in batch):
             continue
 
-        try:
-            x = batch["image"].to(device, non_blocking=True)
-            y = batch["seg_label"].to(device, non_blocking=True)
-            y = select_label_channel(y, out_ch=out_ch, take_first=take_first)
-            local_bad2 = 0
-        except Exception:
-            local_bad2 = 1
+        x = batch["image"].to(device, non_blocking=True)
+        y = batch["seg_label"].to(device, non_blocking=True)
+        y = select_label_channel(y, out_ch=out_ch, take_first=take_first)
 
-        bad2 = torch.tensor([local_bad2], device=device, dtype=torch.int32)
-        bad2_sum = accelerator.reduce(bad2, reduction="sum")
-        if int(bad2_sum.item()) > 0:
-            if accelerator.is_main_process:
-                pbar.set_postfix(skip="to(device)_fail")
-            continue
-
+        t_fw0 = time.time()
         with accelerator.autocast():
             out = model(x)
+        t_fw1 = time.time()
 
         prob = act(out.logits)
         pred = to_bin(prob)
 
+        t_m0 = time.time()
         dice_metric(pred, y)
         d = dice_metric.aggregate().detach()
         dice_metric.reset()
-        if torch.isfinite(d):
-            dice_sum += d
-            dice_cnt += 1.0
 
         pred_has = (pred.sum(dim=(1, 2, 3, 4)) > 0)
         gt_has = (y.sum(dim=(1, 2, 3, 4)) > 0)
@@ -285,16 +278,31 @@ def val_one_epoch(
             hd95_metric(pred[valid], y[valid])
             h = hd95_metric.aggregate().detach()
             hd95_metric.reset()
-            if torch.isfinite(h):
-                hd95_sum += h
-                hd95_cnt += 1.0
+        else:
+            h = torch.tensor(float("nan"), device=device)
+        t_m1 = time.time()
+
+        step_dt = time.time() - step_t0
+        local_timeout = 1 if (step_timeout > 0 and step_dt > step_timeout) else 0
+        timeout = torch.tensor([local_timeout], device=device, dtype=torch.int32)
+        timeout_sum = accelerator.reduce(timeout, reduction="sum")
+        if int(timeout_sum.item()) > 0:
+            if accelerator.is_main_process:
+                pbar.set_postfix(skip=f"timeout({step_dt:.1f}s)", fw=f"{t_fw1-t_fw0:.1f}s", met=f"{t_m1-t_m0:.1f}s")
+            continue
+
+        if torch.isfinite(d):
+            dice_sum += d
+            dice_cnt += 1.0
+        if torch.isfinite(h):
+            hd95_sum += h
+            hd95_cnt += 1.0
 
         if accelerator.is_main_process:
             dice_now = (dice_sum / dice_cnt).item() if dice_cnt.item() > 0 else 0.0
             hd95_now = (hd95_sum / hd95_cnt).item() if hd95_cnt.item() > 0 else 0.0
             pbar.set_postfix(dice=f"{dice_now:.4f}", hd95=f"{hd95_now:.3f}")
 
-    # 全局 reduce（一次）
     dice_sum_g = accelerator.reduce(dice_sum, reduction="sum")
     dice_cnt_g = accelerator.reduce(dice_cnt, reduction="sum")
     hd95_sum_g = accelerator.reduce(hd95_sum, reduction="sum")
@@ -313,6 +321,13 @@ if __name__ == "__main__":
     cfg = load_cfg("config.yml")
 
     run_dir, run_name = prepare_run_dir(cfg)
+
+    # ✅ 只在 rank==0 时启用 console.txt 记录（在 accelerator 初始化前用环境变量判断）
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        txt_log_path = start_txt_logger(run_dir, filename="console.txt")
+        print(f"📝 Console log -> {txt_log_path}")
+
     accelerator = init_accelerator_and_trackers(cfg, run_dir)
 
     seed = int(getattr(cfg.train, "seed", 42))
@@ -384,7 +399,7 @@ if __name__ == "__main__":
             cfg=cfg,
         )
 
-        score = float(val_stats["dice"])  # best criterion: Dice
+        score = float(val_stats["dice"])
 
         save_latest_checkpoint(
             accelerator=accelerator,

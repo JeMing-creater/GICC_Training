@@ -119,6 +119,108 @@ def select_label_channel(y: torch.Tensor, out_ch: int, take_first: bool = True) 
 # -------------------------
 # Logging / TensorBoard (Accelerate trackers)
 # -------------------------
+def start_txt_logger(run_dir: Path, filename: str = "console.txt"):
+    """
+    将本次运行的 stdout/stderr 同时写入终端 + run_dir/filename。
+    - 适配多卡：只在主进程启用（其他 rank 不抢写同一个文件）
+    - 适配异常：注册 sys.excepthook，发生未捕获异常时也写入文件
+
+    返回：log_path (Path) 或 None（非主进程）
+    """
+    import sys
+    import atexit
+    import traceback
+    from datetime import datetime
+
+    log_path = Path(run_dir) / filename
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    class _Tee:
+        def __init__(self, stream, file_obj):
+            self.stream = stream
+            self.file_obj = file_obj
+
+        def write(self, data):
+            try:
+                self.stream.write(data)
+                self.stream.flush()
+            except Exception:
+                pass
+            try:
+                self.file_obj.write(data)
+                self.file_obj.flush()
+            except Exception:
+                pass
+
+        def flush(self):
+            try:
+                self.stream.flush()
+            except Exception:
+                pass
+            try:
+                self.file_obj.flush()
+            except Exception:
+                pass
+
+        def isatty(self):
+            # tqdm 等可能会调用
+            try:
+                return self.stream.isatty()
+            except Exception:
+                return False
+
+    # 打开文件（追加模式，方便 resume）
+    f = open(str(log_path), "a", encoding="utf-8", buffering=1)
+
+    # 写一个 header
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    f.write("\n" + "=" * 90 + "\n")
+    f.write(f"[RUN START] {ts}\n")
+    f.write("=" * 90 + "\n")
+
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = _Tee(old_out, f)
+    sys.stderr = _Tee(old_err, f)
+
+    def _excepthook(exctype, value, tb):
+        try:
+            f.write("\n" + "=" * 90 + "\n")
+            f.write("[UNCAUGHT EXCEPTION]\n")
+            f.write("".join(traceback.format_exception(exctype, value, tb)))
+            f.write("=" * 90 + "\n")
+            f.flush()
+        except Exception:
+            pass
+        # 继续交给原始 hook（保持行为一致）
+        try:
+            sys.__excepthook__(exctype, value, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _excepthook
+
+    def _close():
+        try:
+            ts2 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write("\n" + "=" * 90 + "\n")
+            f.write(f"[RUN END] {ts2}\n")
+            f.write("=" * 90 + "\n")
+            f.flush()
+        except Exception:
+            pass
+        try:
+            sys.stdout = old_out
+            sys.stderr = old_err
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
+
+    atexit.register(_close)
+    return log_path
+
 def prepare_run_dir(cfg: EasyDict) -> Tuple[Path, str]:
     run_name = str(getattr(cfg.logging, "run_name", "")).strip()
     if not run_name:

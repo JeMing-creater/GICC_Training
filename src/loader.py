@@ -1,5 +1,4 @@
 import os
-from sympy import im
 import yaml
 import pandas as pd
 import numpy as np
@@ -87,12 +86,11 @@ class CheckAndFixDimensionsd(MapTransform):
 
 class SafeDataset(MonaiDataset):
     """
-    【安全 Dataset - DDP 友好版】
-    绝不返回 None（DDP 下任何 rank 少一步都会 NCCL timeout）。
-    遇到异常时，自动尝试其它 index，最多 retry 次数。
-    如果连续失败，抛出异常（宁可早失败，也不要训练中 NCCL hang）。
+    【DDP 友好】绝不返回 None。
+    遇到 transform/IO 错误时，自动尝试后续样本（最多 max_retry 次）。
+    连续失败则抛异常：宁可早失败，也不要训练中 NCCL hang。
     """
-    def __init__(self, *args, max_retry: int = 30, **kwargs):
+    def __init__(self, *args, max_retry: int = 50, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_retry = int(max_retry)
 
@@ -100,37 +98,33 @@ class SafeDataset(MonaiDataset):
         last_e = None
         n = len(self.data)
 
-        # 以 index 为起点，线性探测后续样本，最多 max_retry 次
         for k in range(self.max_retry):
             idx = (index + k) % n
             try:
                 return super().__getitem__(idx)
             except Exception as e:
                 last_e = e
-                sample_info = self.data[idx]
-                sample_id = sample_info.get("id", "Unknown")
-                # 建议不要 print 太多（多卡会刷屏）；只在极少数时打印
+                info = self.data[idx] if isinstance(self.data, list) and idx < len(self.data) else {}
+                sid = info.get("id", "Unknown")
                 if k == 0:
-                    print(f"\n❌ [Read Error] idx={idx} ID={sample_id} | {str(e)}")
+                    print(f"\n❌ [Read Error] idx={idx} ID={sid} | {str(e)}")
                 continue
 
         raise RuntimeError(
-            f"[SafeDataset] Failed to fetch a valid sample after {self.max_retry} retries. "
-            f"Last error: {str(last_e)}"
+            f"[SafeDataset] Failed after {self.max_retry} retries. Last error: {str(last_e)}"
         )
-
-
 
 def collate_fn_ignore_none(batch):
     """
-    【DDP 友好 Collate】
-    训练时不允许返回 None（否则不同 rank step 数不一致 -> NCCL hang）。
-    如果 batch 里出现 None，直接过滤；若过滤后为空，抛异常快速暴露问题。
+    【DDP 友好】过滤 None，但过滤后绝不允许为空。
+    如果为空直接 raise，让你定位坏样本，而不是让 DDP 进入“不同步数”导致 NCCL timeout。
     """
     batch = [x for x in batch if x is not None]
     if len(batch) == 0:
-        raise RuntimeError("[collate_fn_ignore_none] Empty batch after filtering None. "
-                           "This will break DDP. Please check dataset/transform errors.")
+        raise RuntimeError(
+            "[collate_fn_ignore_none] Empty batch after filtering None. "
+            "This will break DDP. Please check corrupt files / transform errors."
+        )
     from monai.data import list_data_collate
     return list_data_collate(batch)
 
@@ -333,14 +327,17 @@ def get_loaders(cfg):
     if len(dg_valid) == 0:
         raise ValueError("验证集为空")
 
-    # ✅ DDP 友好：Dataset 不返回 None；collate 不返回 None
-    train_ds = SafeDataset(data=train_list, transform=get_transforms(cfg, "train"), max_retry=30)
-    val_ds = SafeDataset(data=dg_valid, transform=get_transforms(cfg, "val"), max_retry=30)
+    # ✅ Dataset 绝不返回 None（DDP 必需）
+    train_ds = SafeDataset(data=train_list, transform=get_transforms(cfg, "train"), max_retry=50)
+    val_ds = SafeDataset(data=dg_valid, transform=get_transforms(cfg, "val"), max_retry=50)
 
     pin_memory = bool(getattr(cfg, "pin_memory", True))
     num_workers = int(getattr(cfg, "num_workers", 4))
 
-    # ✅ 关键：不要再包 NonEmptyDataLoader（会导致不同 rank step 数不同）
+    # ✅ 关键：timeout 用来“抓卡死样本”（比如 SimpleITK 读到坏文件卡住）
+    # timeout>0 只在 num_workers>0 时有效
+    timeout = int(getattr(cfg, "loader_timeout", 120))  # 秒，建议 60~180
+
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg.batch_size),
@@ -348,7 +345,9 @@ def get_loaders(cfg):
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_fn_ignore_none,
-        drop_last=True,   # ✅ 多卡训练更稳：每个 rank step 数一致
+        drop_last=True,  # ✅ 多卡强烈建议
+        persistent_workers=(num_workers > 0),
+        timeout=timeout if num_workers > 0 else 0,
     )
 
     val_loader = DataLoader(
@@ -358,11 +357,13 @@ def get_loaders(cfg):
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_fn_ignore_none,
-        drop_last=True,   # ✅ 多卡验证也建议 True，避免最后一个不齐导致通信差异
+        drop_last=True,  # ✅ 多卡也建议 True
+        persistent_workers=(num_workers > 0),
+        timeout=timeout if num_workers > 0 else 0,
     )
 
+    # ❌ 不要再包 NonEmptyDataLoader（它会“跳过 batch”，DDP 必挂）
     return train_loader, val_loader
-
 
 # ==========================================
 # 6. 调试/诊断工具

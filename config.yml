@@ -14,6 +14,8 @@ train:
   recon_weight: 0.1
   inv_weight: 0.0
 
+  step_timeout_sec: 120
+
 checkpoint:
   resume: true
   latest_dirname: "latest"
@@ -50,6 +52,7 @@ model:
 data:
   # 服务器上的根目录
   root_dir: "/mnt/liangjm/GICC/"
+  loader_timeout: 120
 
   # Excel配置
   excel_configs:
@@ -73,8 +76,8 @@ data:
   leapfrog: ["101770","91595","126104","66238", "90626", "91458","114821","103174","65716","101770"]
 
   # DataLoader
-  batch_size: 4
-  num_workers: 8
+  batch_size: 1
+  num_workers: 0
   pin_memory: true
 
   # 你的 label 可能是 [B,C,...]（按模态 concat），out_ch=1 时默认取第一个通道
