@@ -16,6 +16,13 @@ train:
 
   step_timeout_sec: 120
 
+eval:
+  mode: "export"      # "metrics" 或 "export"
+  weights_path: "/workspace/GICC_training/log/2026-02-11_23-28-34/checkpoints/best.pth"     # 必填：训练得到的 best 权重路径
+  threshold: 0.5       # 推理阈值
+  case_id: "01105223"          # export 模式必填：病例 id（或 excel_id）
+  out_dir: "exports"   # export 输出目录（会自动创建）
+
 checkpoint:
   resume: true
   latest_dirname: "latest"
@@ -76,7 +83,7 @@ data:
   leapfrog: ["101770","91595","126104","66238", "90626", "91458","114821","103174","65716","101770"]
 
   # DataLoader
-  batch_size: 1
+  batch_size: 2
   num_workers: 0
   pin_memory: true
 

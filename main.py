@@ -209,7 +209,6 @@ def train_one_epoch(
         "hd95": running["hd95"] / max(hd_steps, 1),
     }
 
-
 @torch.no_grad()
 def val_one_epoch(
     *,
@@ -229,12 +228,14 @@ def val_one_epoch(
     dice_metric = DiceMetric(include_background=False, reduction="mean")
     hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
 
-    step_timeout = float(getattr(cfg.train, "step_timeout_sec", 0.0))  # ✅ 只用 train 字段
+    # ✅ 只用 train.step_timeout_sec
+    step_timeout = float(getattr(cfg.train, "step_timeout_sec", 0.0))
 
     out_ch = int(getattr(cfg.model, "out_ch", 1))
     take_first = bool(getattr(cfg.data, "label_take_first_channel", True))
     device = accelerator.device
 
+    # ✅ 全部用 0-dim 标量 tensor（shape []），避免广播错误
     dice_sum = torch.tensor(0.0, device=device)
     dice_cnt = torch.tensor(0.0, device=device)
     hd95_sum = torch.tensor(0.0, device=device)
@@ -258,15 +259,12 @@ def val_one_epoch(
         y = batch["seg_label"].to(device, non_blocking=True)
         y = select_label_channel(y, out_ch=out_ch, take_first=take_first)
 
-        t_fw0 = time.time()
         with accelerator.autocast():
             out = model(x)
-        t_fw1 = time.time()
 
         prob = act(out.logits)
         pred = to_bin(prob)
 
-        t_m0 = time.time()
         dice_metric(pred, y)
         d = dice_metric.aggregate().detach()
         dice_metric.reset()
@@ -280,29 +278,32 @@ def val_one_epoch(
             hd95_metric.reset()
         else:
             h = torch.tensor(float("nan"), device=device)
-        t_m1 = time.time()
 
+        # 超时同步（所有 rank 一起跳过/继续）
         step_dt = time.time() - step_t0
         local_timeout = 1 if (step_timeout > 0 and step_dt > step_timeout) else 0
-        timeout = torch.tensor([local_timeout], device=device, dtype=torch.int32)
+        timeout = torch.tensor(local_timeout, device=device, dtype=torch.int32)
         timeout_sum = accelerator.reduce(timeout, reduction="sum")
         if int(timeout_sum.item()) > 0:
             if accelerator.is_main_process:
-                pbar.set_postfix(skip=f"timeout({step_dt:.1f}s)", fw=f"{t_fw1-t_fw0:.1f}s", met=f"{t_m1-t_m0:.1f}s")
+                pbar.set_postfix(skip=f"timeout({step_dt:.1f}s)")
             continue
 
+        # ✅ 确保 d/h 是标量（shape []）
         if torch.isfinite(d):
-            dice_sum += d
-            dice_cnt += 1.0
+            dice_sum = dice_sum + d.float().view(())
+            dice_cnt = dice_cnt + torch.tensor(1.0, device=device)
+
         if torch.isfinite(h):
-            hd95_sum += h
-            hd95_cnt += 1.0
+            hd95_sum = hd95_sum + h.float().view(())
+            hd95_cnt = hd95_cnt + torch.tensor(1.0, device=device)
 
         if accelerator.is_main_process:
             dice_now = (dice_sum / dice_cnt).item() if dice_cnt.item() > 0 else 0.0
             hd95_now = (hd95_sum / hd95_cnt).item() if hd95_cnt.item() > 0 else 0.0
             pbar.set_postfix(dice=f"{dice_now:.4f}", hd95=f"{hd95_now:.3f}")
 
+    # ✅ 全局 reduce（依旧是标量 shape []）
     dice_sum_g = accelerator.reduce(dice_sum, reduction="sum")
     dice_cnt_g = accelerator.reduce(dice_cnt, reduction="sum")
     hd95_sum_g = accelerator.reduce(hd95_sum, reduction="sum")
@@ -314,7 +315,9 @@ def val_one_epoch(
     stats = {"dice": float(dice_mean), "hd95": float(hd95_mean)}
     if accelerator.is_main_process:
         accelerator.log({"val/dice": stats["dice"], "val/hd95": stats["hd95"], "epoch": epoch}, step=epoch)
+
     return stats
+
 
 
 if __name__ == "__main__":
