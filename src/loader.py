@@ -84,6 +84,81 @@ class CheckAndFixDimensionsd(MapTransform):
                     d[key] = img[..., 0]
         return d
 
+
+class CollectMetaInfod(MapTransform):
+    """
+    收集 LoadImaged 产生的 *_meta_dict，压缩为 d["meta"]（单样本 dict）。
+    注意：collate 由 collate_fn_ignore_none 保持为 List[dict]，避免被 MONAI 拼坏。
+    """
+    def __init__(self, keys, allow_missing_keys: bool = False):
+        super().__init__(keys, allow_missing_keys)
+
+    def __call__(self, data):
+        d = dict(data)
+
+        meta_out = {
+            "id": d.get("id", None),
+            "excel_id": d.get("excel_id", None),
+            "items": {}
+        }
+
+        def _to_list(x):
+            try:
+                import numpy as _np
+                if isinstance(x, _np.ndarray):
+                    return x.tolist()
+            except Exception:
+                pass
+            try:
+                import torch as _torch
+                if _torch.is_tensor(x):
+                    return x.detach().cpu().numpy().tolist()
+            except Exception:
+                pass
+            return x
+
+        for key in self.key_iterator(d):
+            md_key = f"{key}_meta_dict"
+            md = d.get(md_key, None)
+            if md is None:
+                continue
+
+            # 有些 reader 可能返回 list[meta]（极少见），这里做兼容：取第一个
+            if isinstance(md, (list, tuple)) and len(md) > 0:
+                md = md[0]
+
+            if not isinstance(md, dict):
+                continue
+
+            item = {}
+
+            if "filename_or_obj" in md:
+                item["filename"] = str(md["filename_or_obj"])
+
+            if "spatial_shape" in md:
+                try:
+                    item["spatial_shape"] = tuple(int(x) for x in md["spatial_shape"])
+                except Exception:
+                    item["spatial_shape"] = _to_list(md["spatial_shape"])
+
+            if "spacing" in md:
+                item["spacing"] = _to_list(md["spacing"])
+            if "origin" in md:
+                item["origin"] = _to_list(md["origin"])
+            if "direction" in md:
+                item["direction"] = _to_list(md["direction"])
+
+            if "affine" in md:
+                item["affine"] = _to_list(md["affine"])
+            if "original_affine" in md:
+                item["original_affine"] = _to_list(md["original_affine"])
+
+            meta_out["items"][key] = item
+
+        d["meta"] = meta_out
+        return d
+    
+
 class SafeDataset(MonaiDataset):
     """
     【DDP 友好】绝不返回 None。
@@ -116,8 +191,11 @@ class SafeDataset(MonaiDataset):
 
 def collate_fn_ignore_none(batch):
     """
-    【DDP 友好】过滤 None，但过滤后绝不允许为空。
-    如果为空直接 raise，让你定位坏样本，而不是让 DDP 进入“不同步数”导致 NCCL timeout。
+    【DDP 友好 + 保留 meta】
+    - 过滤 None
+    - 过滤后为空则 raise（避免 DDP 不同步）
+    - 对 image/seg_label 等用 monai.list_data_collate
+    - 对 meta：保持为 List[dict]，避免被 list_data_collate 把 dict 深度拼坏
     """
     batch = [x for x in batch if x is not None]
     if len(batch) == 0:
@@ -125,9 +203,24 @@ def collate_fn_ignore_none(batch):
             "[collate_fn_ignore_none] Empty batch after filtering None. "
             "This will break DDP. Please check corrupt files / transform errors."
         )
-    from monai.data import list_data_collate
-    return list_data_collate(batch)
 
+    # 取出 meta（每个样本一个 dict），从 collate 主体里剥离
+    metas = [b.get("meta", None) for b in batch]
+
+    # 构造一个不含 meta 的 batch，交给 MONAI collate
+    batch_wo_meta = []
+    for b in batch:
+        bb = dict(b)
+        if "meta" in bb:
+            bb.pop("meta")
+        batch_wo_meta.append(bb)
+
+    from monai.data import list_data_collate
+    out = list_data_collate(batch_wo_meta)
+
+    # 重新挂回 meta（保持 list）
+    out["meta"] = metas
+    return out
 
 # ==========================================
 # 3. 路径查找与 ID 匹配逻辑
@@ -232,45 +325,59 @@ def build_data_list(config_item, root_dir, leapfrog_list, data_folder_name="All"
 
 def get_transforms(cfg, stage="train"):
     req_mods = cfg.use_modalities
-    image_keys = [f"image_{m}" for m in req_mods] 
+    image_keys = [f"image_{m}" for m in req_mods]
     label_keys = [f"label_{m}" for m in req_mods]
     all_load_keys = image_keys + label_keys
-    
+
     transforms = []
 
-    # 1. 加载 & 维度修复 (必须在最前面)
+    # 1) ✅ 显式 image_only=False，确保生成 *_meta_dict
+    transforms.append(
+        LoadImaged(keys=all_load_keys, image_only=False)
+    )
+
+    # 2) ✅ 立刻收集 raw meta（此时 *_meta_dict 一定还在）
+    transforms.append(
+        CollectMetaInfod(keys=all_load_keys)
+    )
+
+    # 3) 修复维度 + 通道 + 方向
     transforms.extend([
-        LoadImaged(keys=all_load_keys),
-        CheckAndFixDimensionsd(keys=all_load_keys), # 修复4D数据
+        CheckAndFixDimensionsd(keys=all_load_keys),
         EnsureChannelFirstd(keys=all_load_keys),
         Orientationd(keys=all_load_keys, axcodes="RAS"),
     ])
 
-    # 2. 统一尺寸
+    # 4) 统一尺寸（网络空间）
     interp_modes = ['trilinear'] * len(image_keys) + ['nearest'] * len(label_keys)
     transforms.append(
         Resized(
-            keys=all_load_keys, 
-            spatial_size=cfg.target_size, 
-            mode=interp_modes 
+            keys=all_load_keys,
+            spatial_size=cfg.target_size,
+            mode=interp_modes
         )
     )
 
-    # 3. 拼接模态
+    # 5) 拼接模态
     transforms.extend([
         ConcatItemsd(keys=image_keys, name="image", dim=0),
         ConcatItemsd(keys=label_keys, name="seg_label", dim=0),
-        DeleteItemsd(keys=all_load_keys) 
     ])
 
-    # 4. 强度归一化
+    # 6) ✅ 清理原始 keys + *_meta_dict（保留我们整理的 d["meta"]）
+    meta_dict_keys = [f"{k}_meta_dict" for k in all_load_keys]
+    transforms.append(
+        DeleteItemsd(keys=all_load_keys + meta_dict_keys)
+    )
+
+    # 7) 归一化
     transforms.append(
         ScaleIntensityRangePercentilesd(
             keys=["image"], lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, clip=True
         )
     )
 
-    # 5. 数据增强 (仅训练集)
+    # 8) 数据增强（训练集）
     if stage == "train":
         transforms.extend([
             RandRotated(
@@ -288,7 +395,11 @@ def get_transforms(cfg, stage="train"):
             RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.5)
         ])
 
-    transforms.append(EnsureTyped(keys=["image", "seg_label"]))
+    # 9) ✅ image/seg_label 纯 Tensor（不引入 MetaTensor）
+    transforms.append(
+        EnsureTyped(keys=["image", "seg_label"], track_meta=False)
+    )
+
     return Compose(transforms)
 
 # ==========================================

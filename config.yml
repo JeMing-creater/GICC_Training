@@ -1,26 +1,28 @@
 train:
+  choose_model: "Ours"  # [Ours, SwinUNETR]
   seed: 42
-  epochs: 200
-  lr: 0.0002
-  min_lr: 0.000001
-  weight_decay: 0.0001
+  epochs: 120
+  lr: 5e-5
+  min_lr: 0.0000001
+  weight_decay: 1e-4
   scheduler: "cosine"
 
   # accelerate
   grad_accum_steps: 1
-  grad_clip: 0.0
+  grad_clip: 1.0
 
   # DG 范式损失权重（关键：recon_weight>0 才能确保多卡下 Et/G 也参与反传）
-  recon_weight: 0.1
+  recon_weight: 0.02
   inv_weight: 0.0
 
   step_timeout_sec: 120
 
 eval:
-  mode: "export"      # "metrics" 或 "export"
-  weights_path: "/workspace/GICC_training/log/2026-02-11_23-28-34/checkpoints/best.pth"     # 必填：训练得到的 best 权重路径
+  mode: "metrics"      # "metrics" 或 "export"
+  train: true
+  weights_path: "/workspace/GICC_training/log/old/checkpoints/best.pth"     # 必填：训练得到的 best 权重路径
   threshold: 0.5       # 推理阈值
-  case_id: "01105223"          # export 模式必填：病例 id（或 excel_id）
+  case_id: "0000190472"          # export 模式必填：病例 id（或 excel_id）
   out_dir: "exports"   # export 输出目录（会自动创建）
 
 checkpoint:
@@ -32,6 +34,32 @@ checkpoint:
   # 留空则不加载
   init_weights_path: ""
 
+
+other:
+  run_prefix: "other"      # main_other.py 的 run_name 前缀，避免跟 main.py 混
+  model_name: "swinunetr"       # 选择对比模型: "dg" | "unet" | "dynunet"
+  ckpt_suffix: "swinunetr"      # checkpoint 文件/目录后缀，避免与 main.py 冲突（可选，默认跟 model_name 一致）
+
+  # （可选）UNet baseline 的一些超参
+  unet:
+    base_ch: 32
+    num_res_units: 2
+    norm: "INSTANCE"
+
+  # （可选）DynUNet baseline 的一些超参
+  dynunet:
+    filters: 32
+    dropout: 0.0
+    norm: "instance"
+    deep_supervision: false
+    deep_supr_num: 1
+    strides: [1, 2, 2, 2, 2]
+    kernels: [3, 3, 3, 3, 3]
+  
+  # （可选）SwinUNETR baseline 的一些超参
+  swinunetr:
+    feature_size: 96
+
 accelerate:
   # "no" | "fp16" | "bf16"
   mixed_precision: "bf16"
@@ -41,7 +69,7 @@ logging:
   # log 根目录（与 main.py 同级）
   log_root: "log"
   # 留空则自动用时间戳
-  run_name: ""
+  run_name: ""   # 写具体模型名称
   timezone: "Asia/Seoul"
   log_interval: 20
 

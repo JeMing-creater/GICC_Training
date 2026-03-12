@@ -27,10 +27,11 @@ from src.utils import (
     save_best_weights_if_improved,
     maybe_resume_from_latest,
     load_weights,
-    start_txt_logger,   # ✅ 新增：rank0 写 console.txt
+    start_txt_logger,  # ✅ 新增：rank0 写 console.txt
 )
 
 from model import build_model
+from model import get_models
 from model.entry import compute_dg_losses
 
 
@@ -53,15 +54,25 @@ def train_one_epoch(
     inv_weight = float(getattr(cfg.train, "inv_weight", 0.0))
     grad_clip = float(getattr(cfg.train, "grad_clip", 0.0))
     log_interval = int(getattr(cfg.logging, "log_interval", 20))
-    step_timeout = float(getattr(cfg.train, "step_timeout_sec", 0.0))  # ✅ 只用 train 字段
+    step_timeout = float(
+        getattr(cfg.train, "step_timeout_sec", 0.0)
+    )  # ✅ 只用 train 字段
 
     act = Activations(sigmoid=True)
     to_bin = AsDiscrete(threshold=0.5)
 
     dice_metric = DiceMetric(include_background=False, reduction="mean")
-    hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+    hd95_metric = HausdorffDistanceMetric(
+        include_background=False, percentile=95, reduction="mean"
+    )
 
-    running = {"loss": 0.0, "loss_seg": 0.0, "loss_recon": 0.0, "dice": 0.0, "hd95": 0.0}
+    running = {
+        "loss": 0.0,
+        "loss_seg": 0.0,
+        "loss_recon": 0.0,
+        "dice": 0.0,
+        "hd95": 0.0,
+    }
     n_steps = 0
     hd_steps = 0
 
@@ -82,7 +93,12 @@ def train_one_epoch(
 
         # --- 同步 bad batch 判定（所有 rank 一致跳过）---
         local_bad = 0
-        if batch is None or (not isinstance(batch, dict)) or ("image" not in batch) or ("seg_label" not in batch):
+        if (
+            batch is None
+            or (not isinstance(batch, dict))
+            or ("image" not in batch)
+            or ("seg_label" not in batch)
+        ):
             local_bad = 1
         bad = torch.tensor([local_bad], device=device, dtype=torch.int32)
         bad_sum = accelerator.reduce(bad, reduction="sum")
@@ -144,8 +160,8 @@ def train_one_epoch(
             dice_val = dice_metric.aggregate().detach()
             dice_metric.reset()
 
-            pred_has = (pred.sum(dim=(1, 2, 3, 4)) > 0)
-            gt_has = (y.sum(dim=(1, 2, 3, 4)) > 0)
+            pred_has = pred.sum(dim=(1, 2, 3, 4)) > 0
+            gt_has = y.sum(dim=(1, 2, 3, 4)) > 0
             valid = pred_has & gt_has
             if valid.any():
                 hd95_metric(pred[valid], y[valid])
@@ -163,7 +179,11 @@ def train_one_epoch(
         if int(timeout_sum.item()) > 0:
             optimizer.zero_grad(set_to_none=True)
             if accelerator.is_main_process:
-                pbar.set_postfix(skip=f"timeout({step_dt:.1f}s)", fw=f"{t_fw1-t_fw0:.1f}s", met=f"{t_m1-t_m0:.1f}s")
+                pbar.set_postfix(
+                    skip=f"timeout({step_dt:.1f}s)",
+                    fw=f"{t_fw1-t_fw0:.1f}s",
+                    met=f"{t_m1-t_m0:.1f}s",
+                )
             continue
 
         # --- 正常统计 ---
@@ -180,7 +200,12 @@ def train_one_epoch(
         if accelerator.is_main_process:
             avg_loss = running["loss"] / max(n_steps, 1)
             avg_dice = running["dice"] / max(n_steps, 1)
-            pbar.set_postfix(loss=f"{avg_loss:.4f}", dice=f"{avg_dice:.4f}", fw=f"{t_fw1-t_fw0:.1f}s", met=f"{t_m1-t_m0:.1f}s")
+            pbar.set_postfix(
+                loss=f"{avg_loss:.4f}",
+                dice=f"{avg_dice:.4f}",
+                fw=f"{t_fw1-t_fw0:.1f}s",
+                met=f"{t_m1-t_m0:.1f}s",
+            )
 
         if accelerator.is_main_process and (step % log_interval == 0):
             accelerator.log(
@@ -199,7 +224,13 @@ def train_one_epoch(
             )
 
     if n_steps == 0:
-        return {"loss": 0.0, "loss_seg": 0.0, "loss_recon": 0.0, "dice": 0.0, "hd95": 0.0}
+        return {
+            "loss": 0.0,
+            "loss_seg": 0.0,
+            "loss_recon": 0.0,
+            "dice": 0.0,
+            "hd95": 0.0,
+        }
 
     return {
         "loss": running["loss"] / n_steps,
@@ -208,6 +239,7 @@ def train_one_epoch(
         "dice": running["dice"] / n_steps,
         "hd95": running["hd95"] / max(hd_steps, 1),
     }
+
 
 @torch.no_grad()
 def val_one_epoch(
@@ -226,7 +258,9 @@ def val_one_epoch(
     to_bin = AsDiscrete(threshold=0.5)
 
     dice_metric = DiceMetric(include_background=False, reduction="mean")
-    hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+    hd95_metric = HausdorffDistanceMetric(
+        include_background=False, percentile=95, reduction="mean"
+    )
 
     # ✅ 只用 train.step_timeout_sec
     step_timeout = float(getattr(cfg.train, "step_timeout_sec", 0.0))
@@ -252,7 +286,12 @@ def val_one_epoch(
     for step, batch in pbar:
         step_t0 = time.time()
 
-        if batch is None or (not isinstance(batch, dict)) or ("image" not in batch) or ("seg_label" not in batch):
+        if (
+            batch is None
+            or (not isinstance(batch, dict))
+            or ("image" not in batch)
+            or ("seg_label" not in batch)
+        ):
             continue
 
         x = batch["image"].to(device, non_blocking=True)
@@ -269,8 +308,8 @@ def val_one_epoch(
         d = dice_metric.aggregate().detach()
         dice_metric.reset()
 
-        pred_has = (pred.sum(dim=(1, 2, 3, 4)) > 0)
-        gt_has = (y.sum(dim=(1, 2, 3, 4)) > 0)
+        pred_has = pred.sum(dim=(1, 2, 3, 4)) > 0
+        gt_has = y.sum(dim=(1, 2, 3, 4)) > 0
         valid = pred_has & gt_has
         if valid.any():
             hd95_metric(pred[valid], y[valid])
@@ -314,10 +353,12 @@ def val_one_epoch(
 
     stats = {"dice": float(dice_mean), "hd95": float(hd95_mean)}
     if accelerator.is_main_process:
-        accelerator.log({"val/dice": stats["dice"], "val/hd95": stats["hd95"], "epoch": epoch}, step=epoch)
+        accelerator.log(
+            {"val/dice": stats["dice"], "val/hd95": stats["hd95"], "epoch": epoch},
+            step=epoch,
+        )
 
     return stats
-
 
 
 if __name__ == "__main__":
@@ -342,7 +383,12 @@ if __name__ == "__main__":
 
     init_weights_path = str(getattr(cfg.checkpoint, "init_weights_path", "")).strip()
     if init_weights_path:
-        info = load_weights(model=model, weights_path=init_weights_path, strict=False, map_location="cpu")
+        info = load_weights(
+            model=model,
+            weights_path=init_weights_path,
+            strict=False,
+            map_location="cpu",
+        )
         if accelerator.is_main_process:
             accelerator.print(
                 f"🧩 Loaded init weights from {init_weights_path} | "
@@ -351,7 +397,9 @@ if __name__ == "__main__":
 
     if accelerator.is_main_process:
         pinfo = count_parameters(model)
-        accelerator.print(f"🧠 Model params: total={pinfo['total']:,} trainable={pinfo['trainable']:,}")
+        accelerator.print(
+            f"🧠 Model params: total={pinfo['total']:,} trainable={pinfo['trainable']:,}"
+        )
 
     seg_loss_fn = DiceCELoss(sigmoid=True, squared_pred=False, reduction="mean")
 
@@ -373,9 +421,13 @@ if __name__ == "__main__":
         model, optimizer, train_loader, val_loader, scheduler
     )
 
-    start_epoch, best_score = maybe_resume_from_latest(accelerator=accelerator, cfg=cfg, run_dir=run_dir)
+    start_epoch, best_score = maybe_resume_from_latest(
+        accelerator=accelerator, cfg=cfg, run_dir=run_dir
+    )
     if accelerator.is_main_process:
-        accelerator.print(f"🏁 Run: {run_name} | start_epoch={start_epoch} | best_score={best_score}")
+        accelerator.print(
+            f"🏁 Run: {run_name} | start_epoch={start_epoch} | best_score={best_score}"
+        )
 
     epochs = int(cfg.train.epochs)
     for epoch in range(start_epoch, epochs):
