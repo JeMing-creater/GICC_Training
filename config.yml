@@ -11,9 +11,34 @@ train:
   grad_accum_steps: 1
   grad_clip: 1.0
 
-  # DG 范式损失权重（关键：recon_weight>0 才能确保多卡下 Et/G 也参与反传）
+  # multi-task training schedule
+  multitask:
+    enable: true
+    stage_a_epochs: 20
+    freeze_cls_in_stage_a: true
+
+  # loss weights
   recon_weight: 0.02
+  cls_weight: 0.5
   inv_weight: 0.0
+
+  # classification setup
+  classification:
+    loss: "bce"
+    pos_weight: 1.0
+    threshold: 0.5
+
+  # segmentation post-processing threshold for metric computation
+  segmentation:
+    threshold: 0.5
+
+  # best-checkpoint selection
+  model_selection:
+    stage_a_monitor: "dice"   # "dice" | "f1" | "hybrid"
+    monitor: "hybrid"         # "dice" | "f1" | "hybrid"
+    hybrid_weights:
+      dice: 0.7
+      f1: 0.3
 
   step_timeout_sec: 120
 
@@ -137,7 +162,7 @@ data:
   leapfrog: ["101770","91595","126104","66238", "90626", "91458","114821","103174","65716","101770"]
 
   # DataLoader
-  batch_size: 2
+  batch_size: 1
   num_workers: 0
   pin_memory: true
 
