@@ -18,12 +18,28 @@ train:
   step_timeout_sec: 120
 
 eval:
-  mode: "metrics"      # "metrics" 或 "export"
-  train: true
+  mode: "export"      # "metrics" 或 "export"
+  train: false
   weights_path: "/workspace/GICC_training/log/old/checkpoints/best.pth"     # 必填：训练得到的 best 权重路径
   threshold: 0.5       # 推理阈值
-  case_id: "0000190472"          # export 模式必填：病例 id（或 excel_id）
+  case_id: "105259"          # export 模式必填：病例 id（或 excel_id）
   out_dir: "exports"   # export 输出目录（会自动创建）
+  
+  per_sample_dice:
+    out_dir: "analysis/per_sample_dice"
+    xlsx_name: "val_per_sample_dice.xlsx"
+    csv_name: "val_per_sample_dice.csv"
+    json_name: "val_per_sample_dice.json"
+    summary_name: "val_per_sample_dice_summary.txt"
+
+    low_dice: 0.3
+    low_dice_xlsx_name: "val_per_sample_low_dice.xlsx"
+    low_dice_csv_name: "val_per_sample_low_dice.csv"
+    low_dice_json_name: "val_per_sample_low_dice.json"
+
+    worst_k: 20
+  
+  
 
 checkpoint:
   resume: true
@@ -89,7 +105,17 @@ data:
   root_dir: "/mnt/liangjm/GICC/"
   loader_timeout: 120
 
-  # Excel配置
+  # GICC T.xlsx 数据集配置
+  # 用于 GICC 结肠癌 MRI 数据的标签读取和数据集划分
+  t_dataset:
+    excel_filename: "T.xlsx"           # 标签文件
+    id_col: 0                           # ID 列索引 (A列)
+    label_col: 2                        # 二分类标签列索引 (C列: T-sage)
+    train_tag_col: 3                    # train标记列索引 (D列)
+    train_tag_value: "train"            # 标记为训练集的值
+    val_split_ratio: 0.1                # 从train中划分验证集的比例
+
+  # Excel配置 (保留用于其他数据集扩展)
   excel_configs:
     mei:
       filename: "Mei.xlsx"
