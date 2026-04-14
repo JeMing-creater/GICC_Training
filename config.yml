@@ -1,8 +1,8 @@
 train:
   choose_model: "Ours"  # [Ours, SwinUNETR]
   seed: 42
-  epochs: 120
-  lr: 5e-5
+  epochs: 100
+  lr: 0.001
   min_lr: 0.0000001
   weight_decay: 1e-4
   scheduler: "cosine"
@@ -19,7 +19,7 @@ train:
 
   # loss weights
   recon_weight: 0.02
-  cls_weight: 0.5
+  cls_weight: 0.1
   inv_weight: 0.0
 
   # classification setup
@@ -110,7 +110,7 @@ logging:
   # log 根目录（与 main.py 同级）
   log_root: "log"
   # 留空则自动用时间戳
-  run_name: ""   # 写具体模型名称
+  run_name: "Ours4"   # TODO: 写具体模型名称, 不写会产生时间轴，导致覆盖resume
   timezone: "Asia/Seoul"
   log_interval: 20
 
@@ -162,7 +162,7 @@ data:
   leapfrog: ["101770","91595","126104","66238", "90626", "91458","114821","103174","65716","101770"]
 
   # DataLoader
-  batch_size: 1
+  batch_size: 4
   num_workers: 0
   pin_memory: true
 

@@ -95,7 +95,9 @@ class ConvNormAct3d(nn.Module):
             self.act = nn.GELU()
         else:
             self.act = nn.LeakyReLU(0.1, inplace=True)
-        self.drop = nn.Dropout3d(p=float(dropout)) if dropout and dropout > 0 else nn.Identity()
+        self.drop = (
+            nn.Dropout3d(p=float(dropout)) if dropout and dropout > 0 else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.drop(self.act(self.norm(self.conv(x))))
@@ -158,7 +160,9 @@ class StructureEncoder3D(nn.Module):
             )
             if i < self.depth - 1:
                 self.downsamples.append(
-                    ConvNormAct3d(chs[i], chs[i + 1], norm=norm, k=3, s=2, p=1, dropout=dropout)
+                    ConvNormAct3d(
+                        chs[i], chs[i + 1], norm=norm, k=3, s=2, p=1, dropout=dropout
+                    )
                 )
 
     def forward(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
@@ -192,7 +196,9 @@ class StyleEncoder3D(nn.Module):
             blocks.append(ResidualBlock3d(chs[i], norm=norm, dropout=dropout))
             if i < self.depth - 1:
                 blocks.append(
-                    ConvNormAct3d(chs[i], chs[i + 1], norm=norm, k=3, s=2, p=1, dropout=dropout)
+                    ConvNormAct3d(
+                        chs[i], chs[i + 1], norm=norm, k=3, s=2, p=1, dropout=dropout
+                    )
                 )
         self.body = nn.Sequential(*blocks)
         self.pool = nn.AdaptiveAvgPool3d(1)
@@ -216,7 +222,9 @@ class SkipAdapter3D(nn.Module):
     def __init__(self, skip_ch: int, canon_ch: int, norm: str = "instance"):
         super().__init__()
         self.gate = nn.Sequential(
-            nn.Conv3d(canon_ch * 2, skip_ch, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.Conv3d(
+                canon_ch * 2, skip_ch, kernel_size=1, stride=1, padding=0, bias=True
+            ),
             nn.Sigmoid(),
         )
         self.adapter = nn.Sequential(
@@ -224,7 +232,9 @@ class SkipAdapter3D(nn.Module):
             nn.Conv3d(skip_ch, skip_ch, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
-    def forward(self, skip: torch.Tensor, z_up: torch.Tensor, deform_up: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, skip: torch.Tensor, z_up: torch.Tensor, deform_up: torch.Tensor
+    ) -> torch.Tensor:
         gate = self.gate(torch.cat([z_up, deform_up], dim=1))
         return self.adapter(skip + skip * gate)
 
@@ -242,7 +252,9 @@ class TriMambaCanonicalizer(nn.Module):
     ):
         super().__init__()
         if Mamba is None:
-            raise ImportError(f"mamba_ssm is required but unavailable: {_MAMBA_IMPORT_ERROR}")
+            raise ImportError(
+                f"mamba_ssm is required but unavailable: {_MAMBA_IMPORT_ERROR}"
+            )
 
         self.dim = int(dim)
         self.skip_channels = list(skip_channels)
@@ -256,7 +268,9 @@ class TriMambaCanonicalizer(nn.Module):
             nslices=num_slices,
         )
         self.dir_inner_dim = self.mamba.d_inner
-        self.dir_proj = nn.Conv3d(self.dir_inner_dim, dim, kernel_size=1, stride=1, padding=0, bias=True)
+        self.dir_proj = nn.Conv3d(
+            self.dir_inner_dim, dim, kernel_size=1, stride=1, padding=0, bias=True
+        )
 
         self.longitudinal_refine = nn.Sequential(
             ConvNormAct3d(dim, dim, norm=norm, act="gelu", k=3, s=1, p=1),
@@ -283,10 +297,15 @@ class TriMambaCanonicalizer(nn.Module):
             ResidualBlock3d(dim, norm=norm, dropout=0.0),
         )
         self.skip_adapters = nn.ModuleList(
-            [SkipAdapter3D(skip_ch=ch, canon_ch=dim, norm=norm) for ch in self.skip_channels]
+            [
+                SkipAdapter3D(skip_ch=ch, canon_ch=dim, norm=norm)
+                for ch in self.skip_channels
+            ]
         )
 
-    def _to_3d(self, x_seq: torch.Tensor, img_dims: Tuple[int, int, int], project: bool = False) -> torch.Tensor:
+    def _to_3d(
+        self, x_seq: torch.Tensor, img_dims: Tuple[int, int, int], project: bool = False
+    ) -> torch.Tensor:
         b = x_seq.shape[0]
         num_voxels = img_dims[0] * img_dims[1] * img_dims[2]
         if x_seq.shape[1] == num_voxels:
@@ -302,7 +321,9 @@ class TriMambaCanonicalizer(nn.Module):
             feat = self.dir_proj(feat)
         return feat
 
-    def forward(self, z_s: torch.Tensor, skips: Sequence[torch.Tensor]) -> Dict[str, Any]:
+    def forward(
+        self, z_s: torch.Tensor, skips: Sequence[torch.Tensor]
+    ) -> Dict[str, Any]:
         if len(skips) != len(self.skip_channels) + 1:
             raise ValueError(
                 f"Expected {len(self.skip_channels) + 1} skip tensors, got {len(skips)}."
@@ -329,14 +350,21 @@ class TriMambaCanonicalizer(nn.Module):
         anchor_gate = self.anchor_gate(torch.cat([long_consensus, slice_anchor], dim=1))
         canon_anchor = anchor_gate * long_consensus + (1.0 - anchor_gate) * slice_anchor
 
-        z_s_canon = self.align(
-            torch.cat([out_m, canon_anchor, deform_gate * deform_residual], dim=1)
-        ) + z_s
+        z_s_canon = (
+            self.align(
+                torch.cat([out_m, canon_anchor, deform_gate * deform_residual], dim=1)
+            )
+            + z_s
+        )
 
         canon_skips: List[torch.Tensor] = []
         for idx, s in enumerate(skips[:-1]):
-            z_up = F.interpolate(z_s_canon, size=s.shape[-3:], mode="trilinear", align_corners=False)
-            d_up = F.interpolate(deform_gate, size=s.shape[-3:], mode="trilinear", align_corners=False)
+            z_up = F.interpolate(
+                z_s_canon, size=s.shape[-3:], mode="trilinear", align_corners=False
+            )
+            d_up = F.interpolate(
+                deform_gate, size=s.shape[-3:], mode="trilinear", align_corners=False
+            )
             canon_skips.append(self.skip_adapters[idx](s, z_up, d_up))
         canon_skips.append(z_s_canon)
 
@@ -385,22 +413,30 @@ class MultiModalSegDecoder3D(nn.Module):
         self.upconvs = nn.ModuleList()
         self.dec_blocks = nn.ModuleList()
         for i in range(self.depth - 1, 0, -1):
-            self.upconvs.append(nn.ConvTranspose3d(chs[i], chs[i - 1], kernel_size=2, stride=2))
+            self.upconvs.append(
+                nn.ConvTranspose3d(chs[i], chs[i - 1], kernel_size=2, stride=2)
+            )
             self.dec_blocks.append(
                 nn.Sequential(
-                    ConvNormAct3d(chs[i - 1] + chs[i - 1], chs[i - 1], norm=norm, dropout=dropout),
+                    ConvNormAct3d(
+                        chs[i - 1] + chs[i - 1], chs[i - 1], norm=norm, dropout=dropout
+                    ),
                     ResidualBlock3d(chs[i - 1], norm=norm, dropout=dropout),
                 )
             )
         self.head = nn.Conv3d(chs[0], out_ch, kernel_size=1, bias=True)
 
-    def forward(self, z_s_canon: torch.Tensor, canon_skips: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, z_s_canon: torch.Tensor, canon_skips: Sequence[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         h = z_s_canon
         for idx, i in enumerate(range(self.depth - 1, 0, -1)):
             h = self.upconvs[idx](h)
             s = canon_skips[i - 1]
             if h.shape[-3:] != s.shape[-3:]:
-                h = F.interpolate(h, size=s.shape[-3:], mode="trilinear", align_corners=False)
+                h = F.interpolate(
+                    h, size=s.shape[-3:], mode="trilinear", align_corners=False
+                )
             h = torch.cat([h, s], dim=1)
             h = self.dec_blocks[idx](h)
         return self.head(h), h
@@ -429,14 +465,39 @@ class BoundaryRelationAttention(nn.Module):
         )
         self.front_proj = nn.Sequential(
             ConvNormAct3d(in_ch, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=1),
-            ConvNormAct3d(hidden_ch, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=1, groups=hidden_ch),
+            ConvNormAct3d(
+                hidden_ch,
+                hidden_ch,
+                norm=norm,
+                act="gelu",
+                k=3,
+                s=1,
+                p=1,
+                groups=hidden_ch,
+            ),
         )
-        self.context_conv1 = ConvNormAct3d(in_ch, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=2)
-        self.context_conv1.conv = nn.Conv3d(in_ch, hidden_ch, kernel_size=3, stride=1, padding=2, dilation=2, bias=False)
-        self.context_conv2 = ConvNormAct3d(hidden_ch, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=2)
-        self.context_conv2.conv = nn.Conv3d(hidden_ch, hidden_ch, kernel_size=3, stride=1, padding=2, dilation=2, bias=False)
+        self.context_conv1 = ConvNormAct3d(
+            in_ch, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=2
+        )
+        self.context_conv1.conv = nn.Conv3d(
+            in_ch, hidden_ch, kernel_size=3, stride=1, padding=2, dilation=2, bias=False
+        )
+        self.context_conv2 = ConvNormAct3d(
+            hidden_ch, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=2
+        )
+        self.context_conv2.conv = nn.Conv3d(
+            hidden_ch,
+            hidden_ch,
+            kernel_size=3,
+            stride=1,
+            padding=2,
+            dilation=2,
+            bias=False,
+        )
 
-        self.token_attn = nn.MultiheadAttention(hidden_ch, num_heads=num_heads, batch_first=True, dropout=dropout)
+        self.token_attn = nn.MultiheadAttention(
+            hidden_ch, num_heads=num_heads, batch_first=True, dropout=dropout
+        )
         self.token_norm = nn.LayerNorm(hidden_ch)
         self.token_mlp = nn.Sequential(
             nn.Linear(hidden_ch, hidden_ch * 2),
@@ -445,14 +506,20 @@ class BoundaryRelationAttention(nn.Module):
             nn.Linear(hidden_ch * 2, hidden_ch),
         )
         self.spatial_gate = nn.Sequential(
-            nn.Conv3d(hidden_ch * 3, hidden_ch, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.Conv3d(
+                hidden_ch * 3, hidden_ch, kernel_size=1, stride=1, padding=0, bias=True
+            ),
             nn.InstanceNorm3d(hidden_ch),
             nn.GELU(),
-            nn.Conv3d(hidden_ch, hidden_ch, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.Conv3d(
+                hidden_ch, hidden_ch, kernel_size=1, stride=1, padding=0, bias=True
+            ),
             nn.Sigmoid(),
         )
         self.fuse = nn.Sequential(
-            ConvNormAct3d(hidden_ch * 3, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=1),
+            ConvNormAct3d(
+                hidden_ch * 3, hidden_ch, norm=norm, act="gelu", k=3, s=1, p=1
+            ),
             ResidualBlock3d(hidden_ch, norm=norm, dropout=dropout),
         )
         self.classifier = nn.Sequential(
@@ -471,7 +538,9 @@ class BoundaryRelationAttention(nn.Module):
         f_front = self.front_proj(x)
         f_context = self.context_conv2(self.context_conv1(x))
 
-        tokens = torch.stack([self._gap(f_core), self._gap(f_front), self._gap(f_context)], dim=1)
+        tokens = torch.stack(
+            [self._gap(f_core), self._gap(f_front), self._gap(f_context)], dim=1
+        )
         q = tokens[:, 1:2, :]
         attn_out, attn_weights = self.token_attn(q, tokens, tokens, need_weights=True)
         front_token = self.token_norm(q + attn_out)
@@ -479,7 +548,9 @@ class BoundaryRelationAttention(nn.Module):
         front_token = front_token.squeeze(1)
 
         gate = self.spatial_gate(torch.cat([f_core, f_front, f_context], dim=1))
-        fused_spatial = self.fuse(torch.cat([f_core, gate * f_front, (1.0 - gate) * f_context], dim=1))
+        fused_spatial = self.fuse(
+            torch.cat([f_core, gate * f_front, (1.0 - gate) * f_context], dim=1)
+        )
         fused_vec = self._gap(fused_spatial)
         class_logit = self.classifier(torch.cat([front_token, fused_vec], dim=1))
 
@@ -521,7 +592,9 @@ class ReconGenerator3D(nn.Module):
                     ResidualBlock3d(chs[i], norm=norm, dropout=dropout),
                 )
             )
-            self.upconvs.append(nn.ConvTranspose3d(chs[i], chs[i - 1], kernel_size=2, stride=2))
+            self.upconvs.append(
+                nn.ConvTranspose3d(chs[i], chs[i - 1], kernel_size=2, stride=2)
+            )
 
         self.adain0 = AdaIN3d(chs[0], style_dim)
         self.block0 = nn.Sequential(
@@ -546,7 +619,9 @@ class ReconGenerator3D(nn.Module):
         h = self.adain0(h, z_t)
         h = self.block0(h)
         if target_spatial is not None and h.shape[-3:] != target_spatial:
-            h = F.interpolate(h, size=target_spatial, mode="trilinear", align_corners=False)
+            h = F.interpolate(
+                h, size=target_spatial, mode="trilinear", align_corners=False
+            )
         return self.out(h)
 
 
@@ -599,7 +674,9 @@ class CausalDGMultiTaskModel(nn.Module):
         self.depth = int(depth)
         self.base_ch = int(base_ch)
 
-        self.Es = StructureEncoder3D(in_ch=in_ch, base_ch=base_ch, depth=depth, norm=norm, dropout=dropout)
+        self.Es = StructureEncoder3D(
+            in_ch=in_ch, base_ch=base_ch, depth=depth, norm=norm, dropout=dropout
+        )
         self.Et = StyleEncoder3D(
             in_ch=in_ch,
             base_ch=base_ch,
@@ -643,7 +720,9 @@ class CausalDGMultiTaskModel(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, enable_cls_branch: bool = True) -> MultiTaskDGOutput:
+    def forward(
+        self, x: torch.Tensor, enable_cls_branch: bool = True
+    ) -> MultiTaskDGOutput:
         s_pack = self.Es(x)
         z_s = s_pack["z_s"]
         skips = s_pack["skips"]
@@ -751,8 +830,14 @@ def compute_dg_losses(
 # -----------------------------
 def build_model(cfg: Any) -> nn.Module:
     in_ch = _num_modalities_from_cfg(cfg, fallback=1)
-    seg_out_equals_modalities = bool(_cfg_get(cfg, "model.seg_out_equals_modalities", True))
-    seg_out_ch = in_ch if seg_out_equals_modalities else int(_cfg_get(cfg, "model.out_ch", in_ch))
+    seg_out_equals_modalities = bool(
+        _cfg_get(cfg, "model.seg_out_equals_modalities", True)
+    )
+    seg_out_ch = (
+        in_ch
+        if seg_out_equals_modalities
+        else int(_cfg_get(cfg, "model.out_ch", in_ch))
+    )
 
     base_ch = int(_cfg_get(cfg, "model.base_ch", 32))
     depth = int(_cfg_get(cfg, "model.depth", 4))
