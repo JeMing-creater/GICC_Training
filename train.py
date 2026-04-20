@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import gc
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import matplotlib
 
@@ -20,7 +18,6 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric, MeanIoU, compute_hausdorff_distance
 
 from src.loader import get_loaders
@@ -36,7 +33,9 @@ from src.utils import (
     set_seed,
     start_txt_logger,
 )
-from model.dino_model import Model
+
+# 按你的当前模型文件路径修改这里
+from model.structured_uncertainty_model import Model
 
 
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -64,7 +63,7 @@ def _flatten_tb_config(cfg: Any) -> Dict[str, Any]:
         if isinstance(v, (int, float, str, bool)):
             return v
         if torch.is_tensor(v):
-            return v
+            return str(tuple(v.shape))
         return str(v)
 
     def _flatten(prefix: str, obj: Any, out: Dict[str, Any]) -> None:
@@ -123,12 +122,19 @@ def init_accelerator(cfg: Any, run_dir: Path) -> Accelerator:
         import yaml
 
         (run_dir / "config_resolved.yml").write_text(
-            yaml.safe_dump(cfg_to_plain_dict(cfg), allow_unicode=True, sort_keys=False),
+            yaml.safe_dump(
+                cfg_to_plain_dict(cfg),
+                allow_unicode=True,
+                sort_keys=False,
+            ),
             encoding="utf-8",
         )
+
     accelerator.wait_for_everyone()
     accelerator.init_trackers(
-        project_name=str(_cfg_get(cfg, "logging.project_name", "colon_mri_dg_seg")),
+        project_name=str(
+            _cfg_get(cfg, "logging.project_name", "structured_uncertainty")
+        ),
         config=_flatten_tb_config(cfg),
     )
     return accelerator
@@ -137,148 +143,211 @@ def init_accelerator(cfg: Any, run_dir: Path) -> Accelerator:
 def build_model_from_cfg(cfg: Any) -> nn.Module:
     in_ch = int(len(_cfg_get(cfg, "data.use_modalities", [0])))
     out_ch = int(_cfg_get(cfg, "model.out_ch", 1))
-    return Model(in_ch=in_ch, out_ch=out_ch)
+    img_size = tuple(int(v) for v in _cfg_get(cfg, "data.target_size", [128, 128, 64]))
+    return Model(in_ch=in_ch, out_ch=out_ch, img_size=img_size)
 
 
 def build_optimizer(cfg: Any, model: nn.Module) -> AdamW:
-    lr = float(_cfg_get(cfg, "train.lr", 1e-3))
+    lr_backbone = float(
+        _cfg_get(cfg, "train.optimizer.lr_backbone", _cfg_get(cfg, "train.lr", 1e-4))
+    )
+    lr_structure = float(_cfg_get(cfg, "train.optimizer.lr_structure", lr_backbone))
+    lr_cls = float(_cfg_get(cfg, "train.optimizer.lr_cls", lr_backbone))
     wd = float(_cfg_get(cfg, "train.weight_decay", 1e-4))
 
-    raw = model
-    enc_model = getattr(getattr(raw, "enc", None), "model", None)
-    dino_param_ids = (
-        set(id(p) for p in enc_model.parameters()) if enc_model is not None else set()
-    )
-
     backbone_params = []
-    head_params = []
-    for p in raw.parameters():
+    structure_params = []
+    cls_params = []
+
+    for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if id(p) in dino_param_ids:
+        if name.startswith("backbone"):
             backbone_params.append(p)
+        elif name.startswith("cls_head"):
+            cls_params.append(p)
         else:
-            head_params.append(p)
+            structure_params.append(p)
 
     param_groups = []
-    if head_params:
-        param_groups.append({"params": head_params, "lr": lr, "weight_decay": wd})
     if backbone_params:
         param_groups.append(
-            {"params": backbone_params, "lr": lr * 0.1, "weight_decay": wd}
+            {
+                "params": backbone_params,
+                "lr": lr_backbone,
+                "weight_decay": wd,
+                "group_name": "backbone",
+            }
         )
+    if structure_params:
+        param_groups.append(
+            {
+                "params": structure_params,
+                "lr": lr_structure,
+                "weight_decay": wd,
+                "group_name": "structure",
+            }
+        )
+    if cls_params:
+        param_groups.append(
+            {
+                "params": cls_params,
+                "lr": lr_cls,
+                "weight_decay": wd,
+                "group_name": "cls",
+            }
+        )
+
     return AdamW(param_groups)
 
 
-def _get_stage(epoch: int, cfg: Any) -> str:
-    a_epochs = int(
-        _cfg_get(
-            cfg,
-            "train.three_stage.stage_a_epochs",
-            _cfg_get(cfg, "train.multitask.stage_a_epochs", 20),
-        )
+def _set_requires_grad_for_module(mod: Optional[nn.Module], flag: bool) -> None:
+    if mod is None:
+        return
+    for p in mod.parameters():
+        p.requires_grad = flag
+
+
+def _compute_curriculum_stage(epoch: int, cfg: Any) -> Dict[str, Any]:
+    epochs = int(_cfg_get(cfg, "train.epochs", 100))
+    warmup_epochs = int(_cfg_get(cfg, "train.curriculum.warmup_epochs", 15))
+    cls_only_epochs = int(_cfg_get(cfg, "train.curriculum.cls_only_epochs", 10))
+    finetune_epochs = int(_cfg_get(cfg, "train.curriculum.finetune_epochs", 10))
+    unc_ramp_epochs = int(_cfg_get(cfg, "train.curriculum.uncertainty_ramp_epochs", 20))
+
+    cls_only_start = max(warmup_epochs, epochs - cls_only_epochs - finetune_epochs)
+    finetune_start = max(cls_only_start, epochs - finetune_epochs)
+
+    if epoch < warmup_epochs:
+        stage = "warmup"
+    elif epoch < cls_only_start:
+        stage = "uncertainty"
+    elif epoch < finetune_start:
+        stage = "cls_only"
+    else:
+        stage = "finetune"
+
+    progress_unc = 0.0
+    if stage in ("uncertainty", "finetune"):
+        raw = (epoch - warmup_epochs + 1) / max(unc_ramp_epochs, 1)
+        progress_unc = float(min(1.0, max(0.0, raw)))
+
+    w_seg = float(_cfg_get(cfg, "train.loss_weights.seg", 1.0))
+    w_unc_final = float(_cfg_get(cfg, "train.loss_weights.unc_final", 0.5))
+    w_core_final = float(_cfg_get(cfg, "train.loss_weights.core_final", 0.2))
+    w_rim_final = float(_cfg_get(cfg, "train.loss_weights.rim_final", 0.3))
+    w_cls_final = float(_cfg_get(cfg, "train.loss_weights.cls_final", 1.0))
+    w_cls_uncertainty = float(
+        _cfg_get(cfg, "train.loss_weights.cls_in_uncertainty_stage", 0.0)
     )
-    b_epochs = int(_cfg_get(cfg, "train.three_stage.stage_b_epochs", 50))
-    if epoch < a_epochs:
-        return "stage_a"
-    if epoch < a_epochs + b_epochs:
-        return "stage_b"
-    return "stage_c"
+    w_cls_finetune = float(
+        _cfg_get(cfg, "train.loss_weights.cls_in_finetune_stage", w_cls_final)
+    )
 
+    if stage == "warmup":
+        weights = {
+            "seg": w_seg,
+            "cls": 0.0,
+            "unc": 0.0,
+            "core": 0.0,
+            "rim": 0.0,
+        }
+    elif stage == "uncertainty":
+        weights = {
+            "seg": w_seg,
+            "cls": w_cls_uncertainty,
+            "unc": w_unc_final * progress_unc,
+            "core": w_core_final * progress_unc,
+            "rim": w_rim_final * progress_unc,
+        }
+    elif stage == "cls_only":
+        weights = {
+            "seg": 0.0,
+            "cls": w_cls_final,
+            "unc": 0.0,
+            "core": 0.0,
+            "rim": 0.0,
+        }
+    else:
+        weights = {
+            "seg": w_seg,
+            "cls": w_cls_finetune,
+            "unc": w_unc_final,
+            "core": w_core_final,
+            "rim": w_rim_final,
+        }
 
-def _dino_blocks(raw_model: nn.Module) -> list[nn.Module]:
-    enc_model = getattr(getattr(raw_model, "enc", None), "model", None)
-    if enc_model is None:
-        return []
-    for attr in ["encoder", "dinov2", "vit", "backbone"]:
-        obj = getattr(enc_model, attr, None)
-        if obj is not None:
-            if hasattr(obj, "layer"):
-                return list(obj.layer)
-            if hasattr(obj, "layers"):
-                return list(obj.layers)
-    if hasattr(enc_model, "encoder") and hasattr(enc_model.encoder, "layer"):
-        return list(enc_model.encoder.layer)
-    return []
+    return {
+        "stage": stage,
+        "weights": weights,
+        "warmup_epochs": warmup_epochs,
+        "cls_only_start": cls_only_start,
+        "finetune_start": finetune_start,
+        "use_uncertainty": stage in ("uncertainty", "finetune"),
+    }
 
 
 def apply_stage_policy(
-    model: nn.Module, accelerator: Accelerator, stage: str, cfg: Any
+    model: nn.Module, accelerator: Accelerator, stage_cfg: Dict[str, Any], cfg: Any
 ) -> Dict[str, Any]:
     raw = accelerator.unwrap_model(model)
+    stage = stage_cfg["stage"]
 
-    # default: everything trainable except DINO body controlled below
+    # 默认全开
     for p in raw.parameters():
         p.requires_grad = True
 
-    # always keep DINO input projection trainable
-    if hasattr(raw, "enc") and hasattr(raw.enc, "proj"):
-        for p in raw.enc.proj.parameters():
-            p.requires_grad = True
-
-    enc_model = getattr(getattr(raw, "enc", None), "model", None)
-    blocks = _dino_blocks(raw)
-    n_blocks = len(blocks)
-
-    # freeze all DINO backbone first
-    if enc_model is not None:
-        for p in enc_model.parameters():
-            p.requires_grad = False
-
-    # cls defaults
-    cls_weight = 0.0
-    train_cls = False
-
-    if stage == "stage_a":
-        train_cls = False
-        cls_weight = 0.0
-    elif stage == "stage_b":
-        unfreeze_last = int(
-            _cfg_get(cfg, "train.three_stage.unfreeze_last_n_blocks_stage_b", 2)
-        )
-        if n_blocks > 0:
-            for blk in blocks[max(0, n_blocks - unfreeze_last) :]:
-                for p in blk.parameters():
-                    p.requires_grad = True
-        train_cls = False
-        cls_weight = 0.0
-    else:
-        unfreeze_last = int(
-            _cfg_get(cfg, "train.three_stage.unfreeze_last_n_blocks_stage_c", 4)
-        )
-        if n_blocks > 0:
-            for blk in blocks[max(0, n_blocks - unfreeze_last) :]:
-                for p in blk.parameters():
-                    p.requires_grad = True
-        train_cls = True
-        cls_weight = float(
-            _cfg_get(
-                cfg,
-                "train.three_stage.cls_weight_stage_c",
-                _cfg_get(cfg, "train.cls_weight", 0.1),
-            )
-        )
-
-    # freeze/unfreeze cls head hard to avoid unused grads in early stages
-    if hasattr(raw, "cls"):
-        for p in raw.cls.parameters():
-            p.requires_grad = train_cls
-
-    # head modules always trainable
-    for name in ["mamba", "seg", "dummy"]:
-        mod = getattr(raw, name, None)
-        if mod is not None:
-            for p in mod.parameters():
-                p.requires_grad = True
+    if stage == "warmup":
+        _set_requires_grad_for_module(getattr(raw, "cls_head", None), False)
+    elif stage == "uncertainty":
+        _set_requires_grad_for_module(getattr(raw, "cls_head", None), False)
+    elif stage == "cls_only":
+        _set_requires_grad_for_module(getattr(raw, "backbone", None), False)
+        _set_requires_grad_for_module(getattr(raw, "feat_proj", None), False)
+        _set_requires_grad_for_module(getattr(raw, "z_mamba", None), False)
+        _set_requires_grad_for_module(getattr(raw, "uncertainty", None), False)
+        _set_requires_grad_for_module(getattr(raw, "cls_head", None), True)
+    elif stage == "finetune":
+        # 全部打开，但 backbone 低学习率由 optimizer group 控制
+        pass
 
     trainable = sum(p.numel() for p in raw.parameters() if p.requires_grad)
-    return {
-        "stage": stage,
-        "train_cls": train_cls,
-        "cls_weight": cls_weight,
-        "n_dino_blocks": n_blocks,
-        "trainable_params": trainable,
-    }
+    frozen = sum(p.numel() for p in raw.parameters() if not p.requires_grad)
+    return {"trainable_params": trainable, "frozen_params": frozen, "stage": stage}
+
+
+def _update_optimizer_lrs(optimizer: AdamW, stage: str, cfg: Any) -> None:
+    base_backbone = float(
+        _cfg_get(cfg, "train.optimizer.lr_backbone", _cfg_get(cfg, "train.lr", 1e-4))
+    )
+    base_structure = float(_cfg_get(cfg, "train.optimizer.lr_structure", base_backbone))
+    base_cls = float(_cfg_get(cfg, "train.optimizer.lr_cls", base_backbone))
+
+    if stage == "warmup":
+        mult = {"backbone": 1.0, "structure": 1.0, "cls": 0.0}
+    elif stage == "uncertainty":
+        mult = {"backbone": 1.0, "structure": 1.0, "cls": 0.0}
+    elif stage == "cls_only":
+        mult = {"backbone": 0.0, "structure": 0.0, "cls": 1.0}
+    else:
+        mult = {
+            "backbone": float(
+                _cfg_get(cfg, "train.optimizer.finetune_backbone_mult", 0.2)
+            ),
+            "structure": float(
+                _cfg_get(cfg, "train.optimizer.finetune_structure_mult", 0.5)
+            ),
+            "cls": float(_cfg_get(cfg, "train.optimizer.finetune_cls_mult", 1.0)),
+        }
+
+    for group in optimizer.param_groups:
+        name = group.get("group_name", "")
+        if name == "backbone":
+            group["lr"] = base_backbone * mult["backbone"]
+        elif name == "structure":
+            group["lr"] = base_structure * mult["structure"]
+        elif name == "cls":
+            group["lr"] = base_cls * mult["cls"]
 
 
 def _reduce_scalar(
@@ -294,26 +363,32 @@ def _prepare_batch(
     x = batch["image"].to(device, non_blocking=True)
     y_seg = batch["seg_label"].to(device, non_blocking=True)
     y_cls = batch["class_label"].to(device, non_blocking=True).float()
+
     out_ch = int(_cfg_get(cfg, "model.out_ch", 1))
     take_first = bool(_cfg_get(cfg, "data.label_take_first_channel", True))
     y_seg = select_label_channel(y_seg, out_ch=out_ch, take_first=take_first).float()
     return x, y_seg, y_cls
 
 
-def compute_losses(
-    out, y_seg, y_cls, seg_loss_fn, cls_loss_fn, cls_weight: float
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    loss_seg = seg_loss_fn(out.seg, y_seg)
-    loss_cls = cls_loss_fn(out.cls, y_cls) if cls_weight > 0 else out.cls.new_zeros(())
-    loss = loss_seg + cls_weight * loss_cls
-    return loss, {
-        "loss_seg": float(loss_seg.detach().item()),
-        "loss_cls": (
-            float(loss_cls.detach().item())
-            if torch.is_tensor(loss_cls)
-            else float(loss_cls)
-        ),
-    }
+def _compose_weighted_loss(
+    loss_dict: Dict[str, torch.Tensor], stage_cfg: Dict[str, Any]
+) -> torch.Tensor:
+    w = stage_cfg["weights"]
+
+    def _get(name: str) -> torch.Tensor:
+        if name in loss_dict:
+            return loss_dict[name]
+        ref = next(iter(loss_dict.values()))
+        return ref * 0.0
+
+    loss = (
+        w["seg"] * _get("loss_seg")
+        + w["cls"] * _get("loss_cls")
+        + w["unc"] * _get("loss_unc")
+        + w["core"] * _get("loss_core")
+        + w["rim"] * _get("loss_rim")
+    )
+    return loss
 
 
 def _compute_seg_step_metrics(
@@ -371,12 +446,17 @@ def _compute_cls_counts(
     return {"tp": tp, "tn": tn, "fp": fp, "fn": fn}
 
 
-def _choose_vis_slice(y_seg: torch.Tensor) -> int:
-    # y_seg [1,1,W,H,Z] preferred
+def _choose_vis_slice(
+    y_seg: torch.Tensor, seg_prob: Optional[torch.Tensor] = None
+) -> int:
     vol = y_seg[0, 0]
-    flat = vol.sum(dim=(0, 1))
-    idx = int(torch.argmax(flat).item())
-    return idx
+    gt_sum = vol.sum(dim=(0, 1))
+    if float(gt_sum.max().item()) > 0:
+        return int(torch.argmax(gt_sum).item())
+    if seg_prob is not None:
+        pred_sum = seg_prob[0, 0].sum(dim=(0, 1))
+        return int(torch.argmax(pred_sum).item())
+    return int(vol.shape[-1] // 2)
 
 
 def _norm01(arr: np.ndarray) -> np.ndarray:
@@ -399,6 +479,16 @@ def _overlay_mask(
     return np.clip(out, 0.0, 1.0)
 
 
+def _overlay_heatmap(gray: np.ndarray, heat: np.ndarray) -> np.ndarray:
+    gray = _norm01(gray)
+    heat = _norm01(heat)
+    rgb = np.stack([gray, gray, gray], axis=-1)
+    cmap = plt.get_cmap("jet")
+    heat_rgb = cmap(heat)[..., :3].astype(np.float32)
+    alpha = 0.45
+    out = rgb * (1.0 - alpha) + heat_rgb * alpha
+    return np.clip(out, 0.0, 1.0)
+
 
 def save_visualization(
     *,
@@ -409,8 +499,17 @@ def save_visualization(
     epoch: int,
     split_name: str,
     run_dir: Path,
+    stage_cfg: Dict[str, Any],
 ) -> None:
     if not accelerator.is_main_process:
+        return
+    if not bool(_cfg_get(cfg, "logging.visualization.enable", True)):
+        return
+    if not stage_cfg["use_uncertainty"]:
+        return
+
+    vis_splits = list(_cfg_get(cfg, "logging.visualization.splits", ["val"]))
+    if split_name not in vis_splits:
         return
 
     raw_model = accelerator.unwrap_model(model)
@@ -421,71 +520,31 @@ def save_visualization(
 
     raw_model.eval()
     with torch.no_grad():
-        # -----------------------------
-        # current model forward pipeline
-        # -----------------------------
-        z_global = raw_model.enc(x_vis)
-        z_global = raw_model.mamba(z_global)
-
-        local_feat, local_anchor_logits = raw_model.local_stem(x_vis)
-        z_fused = raw_model.local_global_fuse(
-            z_global, local_feat, local_anchor_logits
-        )
-
         out = raw_model(x_vis)
 
-    # -----------------------------------------
-    # basic data
-    # -----------------------------------------
+    seg_prob = torch.sigmoid(out.seg[:1])
+    seg_pred = (
+        seg_prob >= float(_cfg_get(cfg, "train.segmentation.threshold", 0.5))
+    ).float()
+    core_prob = torch.sigmoid(out.core[:1])
+    rim_prob = torch.sigmoid(out.rim[:1])
+    unc_prob = torch.sigmoid(out.unc[:1])
+
     modalities = list(_cfg_get(cfg, "data.use_modalities", []))
     num_mod = int(x_vis.shape[1])
     if len(modalities) != num_mod:
         modalities = [f"mod_{i}" for i in range(num_mod)]
 
-    pred = (
-        torch.sigmoid(out.seg[:1])
-        >= float(_cfg_get(cfg, "train.segmentation.threshold", 0.5))
-    ).float()
+    z_idx = _choose_vis_slice(y_vis, seg_prob=seg_prob)
 
-    # GT / pred -> visualization mask
-    gt_vol = y_vis[0].detach().float().cpu().numpy()      # [C,W,H,Z]
-    pred_vol = pred[0].detach().float().cpu().numpy()     # [C,W,H,Z]
+    gt_mask = y_vis[0, 0].detach().float().cpu().numpy()
+    pred_mask = seg_pred[0, 0].detach().float().cpu().numpy()
+    core_map = core_prob[0, 0].detach().float().cpu().numpy()
+    rim_map = rim_prob[0, 0].detach().float().cpu().numpy()
+    unc_map = unc_prob[0, 0].detach().float().cpu().numpy()
 
-    if gt_vol.shape[0] == 1:
-        gt_mask = gt_vol[0]
-    else:
-        gt_mask = gt_vol.mean(axis=0)
-
-    if pred_vol.shape[0] == 1:
-        pred_mask = pred_vol[0]
-    else:
-        pred_mask = pred_vol.mean(axis=0)
-
-    # -----------------------------------------
-    # shared semantic focus from fused feature
-    # -----------------------------------------
-    shared_focus = z_fused.abs().mean(dim=1, keepdim=True)  # [1,1,w,h,Z]
-    shared_focus = F.interpolate(
-        shared_focus, size=x_vis.shape[-3:], mode="trilinear", align_corners=False
-    )
-    shared_focus = shared_focus[0, 0].detach().float().cpu().numpy()  # [W,H,Z]
-
-    # -----------------------------------------
-    # local anchor heatmap from local branch
-    # -----------------------------------------
-    local_anchor = torch.sigmoid(local_anchor_logits)  # [1,1,Wl,Hl,Z]
-    local_anchor = F.interpolate(
-        local_anchor, size=x_vis.shape[-3:], mode="trilinear", align_corners=False
-    )
-    local_anchor = local_anchor[0, 0].detach().float().cpu().numpy()  # [W,H,Z]
-
-    z_idx = _choose_vis_slice(y_vis)
-
-    # -----------------------------------------
-    # plot: each modality is one row, each row has 5 columns
-    # -----------------------------------------
     n_rows = num_mod
-    n_cols = 5
+    n_cols = 6
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
@@ -494,57 +553,52 @@ def save_visualization(
         squeeze=False,
     )
 
-    shared_focus_slice = _norm01(shared_focus[:, :, z_idx])
-    local_anchor_slice = _norm01(local_anchor[:, :, z_idx])
-
     for m in range(num_mod):
-        raw_vol = x_vis[0, m].detach().float().cpu().numpy()   # [W,H,Z]
+        raw_vol = x_vis[0, m].detach().float().cpu().numpy()
         raw_slice = raw_vol[:, :, z_idx]
-        raw_norm = _norm01(raw_slice)
-
         gt_slice = gt_mask[:, :, z_idx]
         pred_slice = pred_mask[:, :, z_idx]
+        core_slice = core_map[:, :, z_idx]
+        rim_slice = rim_map[:, :, z_idx]
+        unc_slice = unc_map[:, :, z_idx]
 
         row_axes = axes[m]
-
-        # 1) Shared semantic focus
-        row_axes[0].imshow(raw_norm, cmap="gray")
-        row_axes[0].imshow(shared_focus_slice, cmap="jet", alpha=0.45)
-        row_axes[0].set_title(f"{modalities[m]} | Shared semantic focus")
+        row_axes[0].imshow(_norm01(raw_slice), cmap="gray")
+        row_axes[0].set_title(f"{modalities[m]} | Raw")
         row_axes[0].axis("off")
 
-        # 2) Local anchor heatmap
-        row_axes[1].imshow(raw_norm, cmap="gray")
-        row_axes[1].imshow(local_anchor_slice, cmap="jet", alpha=0.45)
-        row_axes[1].set_title(f"{modalities[m]} | Local anchor heatmap")
+        row_axes[1].imshow(_overlay_mask(raw_slice, gt_slice, (0.0, 1.0, 0.0)))
+        row_axes[1].set_title(f"{modalities[m]} | GT")
         row_axes[1].axis("off")
 
-        # 3) image heatmap
-        row_axes[2].imshow(raw_slice, cmap="inferno")
-        row_axes[2].set_title(f"{modalities[m]} | Image heatmap")
+        row_axes[2].imshow(_overlay_mask(raw_slice, pred_slice, (1.0, 0.0, 0.0)))
+        row_axes[2].set_title(f"{modalities[m]} | Pred")
         row_axes[2].axis("off")
 
-        # 4) GT overlay
-        row_axes[3].imshow(_overlay_mask(raw_slice, gt_slice, (0.0, 1.0, 0.0)))
-        row_axes[3].set_title(f"{modalities[m]} | GT overlay")
+        row_axes[3].imshow(_overlay_heatmap(raw_slice, core_slice))
+        row_axes[3].set_title(f"{modalities[m]} | Core")
         row_axes[3].axis("off")
 
-        # 5) Pred overlay
-        row_axes[4].imshow(_overlay_mask(raw_slice, pred_slice, (1.0, 0.0, 0.0)))
-        row_axes[4].set_title(f"{modalities[m]} | Pred overlay")
+        row_axes[4].imshow(_overlay_heatmap(raw_slice, rim_slice))
+        row_axes[4].set_title(f"{modalities[m]} | Rim")
         row_axes[4].axis("off")
+
+        row_axes[5].imshow(_overlay_heatmap(raw_slice, unc_slice))
+        row_axes[5].set_title(f"{modalities[m]} | Unc")
+        row_axes[5].axis("off")
 
     vis_dir = run_dir / "visuals" / split_name
     vis_dir.mkdir(parents=True, exist_ok=True)
-    save_path = vis_dir / f"epoch_{epoch:04d}.png"
+    save_path = vis_dir / f"epoch_{epoch:04d}_{stage_cfg['stage']}.png"
     fig.tight_layout()
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
 
-    del z_global, local_feat, local_anchor_logits, z_fused, out, pred
+    del out, seg_prob, seg_pred, core_prob, rim_prob, unc_prob
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-       
+
+
 def run_one_epoch(
     *,
     split_name: str,
@@ -553,8 +607,6 @@ def run_one_epoch(
     model: nn.Module,
     data_loader,
     optimizer: Optional[torch.optim.Optimizer],
-    seg_loss_fn: nn.Module,
-    cls_loss_fn: nn.Module,
     epoch: int,
     stage_cfg: Dict[str, Any],
     cfg: Any,
@@ -565,10 +617,12 @@ def run_one_epoch(
     device = accelerator.device
     grad_clip = float(_cfg_get(cfg, "train.grad_clip", 0.0))
     log_interval = int(_cfg_get(cfg, "logging.log_interval", 20))
-    cls_weight = float(stage_cfg["cls_weight"])
+    raw_model = accelerator.unwrap_model(model)
 
     if is_train:
         model.train()
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
     else:
         model.eval()
 
@@ -576,6 +630,9 @@ def run_one_epoch(
         "loss": 0.0,
         "loss_seg": 0.0,
         "loss_cls": 0.0,
+        "loss_unc": 0.0,
+        "loss_core": 0.0,
+        "loss_rim": 0.0,
         "seg_dice": 0.0,
         "seg_hd95": 0.0,
         "seg_miou": 0.0,
@@ -605,31 +662,38 @@ def run_one_epoch(
         x, y_seg, y_cls = _prepare_batch(batch, device, cfg)
 
         if is_train:
-            optimizer.zero_grad(set_to_none=True)
             with accelerator.accumulate(model):
                 with accelerator.autocast():
                     out = model(x)
-                    loss, loss_parts = compute_losses(
-                        out, y_seg, y_cls, seg_loss_fn, cls_loss_fn, cls_weight
-                    )
+                    loss_dict = raw_model.compute_loss(out, y_seg, y_cls)
+                    loss = _compose_weighted_loss(loss_dict, stage_cfg)
+
                 accelerator.backward(loss)
-                if grad_clip > 0:
+
+                if accelerator.sync_gradients and grad_clip > 0:
                     accelerator.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
+
+                if optimizer is not None:
+                    optimizer.step()
+
+                if optimizer is not None and accelerator.sync_gradients:
+                    optimizer.zero_grad(set_to_none=True)
         else:
             with torch.no_grad():
                 with accelerator.autocast():
                     out = model(x)
-                    loss, loss_parts = compute_losses(
-                        out, y_seg, y_cls, seg_loss_fn, cls_loss_fn, cls_weight
-                    )
+                    loss_dict = raw_model.compute_loss(out, y_seg, y_cls)
+                    loss = _compose_weighted_loss(loss_dict, stage_cfg)
 
         seg_metrics = _compute_seg_step_metrics(out.seg.detach(), y_seg.detach(), cfg)
         cls_counts = _compute_cls_counts(out.cls.detach(), y_cls.detach(), cfg)
 
         running["loss"] += float(loss.detach().item())
-        running["loss_seg"] += float(loss_parts["loss_seg"])
-        running["loss_cls"] += float(loss_parts["loss_cls"])
+        running["loss_seg"] += float(loss_dict["loss_seg"].detach().item())
+        running["loss_cls"] += float(loss_dict["loss_cls"].detach().item())
+        running["loss_unc"] += float(loss_dict["loss_unc"].detach().item())
+        running["loss_core"] += float(loss_dict["loss_core"].detach().item())
+        running["loss_rim"] += float(loss_dict["loss_rim"].detach().item())
         running["seg_dice"] += float(seg_metrics["dice"])
         running["seg_hd95"] += float(seg_metrics["hd95"])
         running["seg_hd95_cnt"] += float(seg_metrics["hd95_cnt"])
@@ -663,6 +727,7 @@ def run_one_epoch(
             epoch=epoch,
             split_name=split_name,
             run_dir=run_dir,
+            stage_cfg=stage_cfg,
         )
 
     if n_steps == 0:
@@ -670,6 +735,9 @@ def run_one_epoch(
             "loss": 0.0,
             "loss_seg": 0.0,
             "loss_cls": 0.0,
+            "loss_unc": 0.0,
+            "loss_core": 0.0,
+            "loss_rim": 0.0,
             "seg_dice": 0.0,
             "seg_hd95": 0.0,
             "seg_miou": 0.0,
@@ -683,6 +751,9 @@ def run_one_epoch(
     loss = _reduce_scalar(accelerator, running["loss"], device)
     loss_seg = _reduce_scalar(accelerator, running["loss_seg"], device)
     loss_cls = _reduce_scalar(accelerator, running["loss_cls"], device)
+    loss_unc = _reduce_scalar(accelerator, running["loss_unc"], device)
+    loss_core = _reduce_scalar(accelerator, running["loss_core"], device)
+    loss_rim = _reduce_scalar(accelerator, running["loss_rim"], device)
     seg_dice = _reduce_scalar(accelerator, running["seg_dice"], device)
     seg_hd95 = _reduce_scalar(accelerator, running["seg_hd95"], device)
     seg_hd95_cnt = _reduce_scalar(accelerator, running["seg_hd95_cnt"], device)
@@ -698,6 +769,9 @@ def run_one_epoch(
         "loss": loss / max(n_steps_g, 1.0),
         "loss_seg": loss_seg / max(n_steps_g, 1.0),
         "loss_cls": loss_cls / max(n_steps_g, 1.0),
+        "loss_unc": loss_unc / max(n_steps_g, 1.0),
+        "loss_core": loss_core / max(n_steps_g, 1.0),
+        "loss_rim": loss_rim / max(n_steps_g, 1.0),
         "seg_dice": seg_dice / max(n_steps_g, 1.0),
         "seg_hd95": seg_hd95 / max(seg_hd95_cnt, 1.0),
         "seg_miou": seg_miou / max(n_steps_g, 1.0),
@@ -714,6 +788,9 @@ def run_one_epoch(
                 f"{split_name}/loss": stats["loss"],
                 f"{split_name}/loss_seg": stats["loss_seg"],
                 f"{split_name}/loss_cls": stats["loss_cls"],
+                f"{split_name}/loss_unc": stats["loss_unc"],
+                f"{split_name}/loss_core": stats["loss_core"],
+                f"{split_name}/loss_rim": stats["loss_rim"],
                 f"{split_name}/seg_dice": stats["seg_dice"],
                 f"{split_name}/seg_hd95": stats["seg_hd95"],
                 f"{split_name}/seg_miou": stats["seg_miou"],
@@ -726,25 +803,22 @@ def run_one_epoch(
             },
             step=epoch,
         )
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return stats
 
 
-def _build_cls_loss_fn(cfg: Any, device: torch.device) -> nn.Module:
-    pos_weight = float(_cfg_get(cfg, "train.classification.pos_weight", 1.0))
-    if pos_weight > 0 and abs(pos_weight - 1.0) > 1e-8:
-        return nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pos_weight], device=device)
-        )
-    return nn.BCEWithLogitsLoss()
-
-
-def _compute_monitor_score(val_stats: Dict[str, float], stage: str, cfg: Any) -> float:
-    # stage A/B emphasize segmentation; stage C hybrid
-    if stage in ("stage_a", "stage_b"):
+def _compute_monitor_score(val_stats: Dict[str, float], cfg: Any) -> float:
+    monitor = str(_cfg_get(cfg, "train.model_selection.monitor", "hybrid")).lower()
+    if monitor == "seg_dice":
         return float(val_stats["seg_dice"])
+    if monitor == "cls_f1":
+        return float(val_stats["cls_f1"])
+    if monitor == "cls_acc":
+        return float(val_stats["cls_acc"])
+
     dice_w = float(_cfg_get(cfg, "train.model_selection.hybrid_weights.dice", 0.7))
     f1_w = float(_cfg_get(cfg, "train.model_selection.hybrid_weights.f1", 0.3))
     return dice_w * float(val_stats["seg_dice"]) + f1_w * float(val_stats["cls_f1"])
@@ -771,6 +845,7 @@ def train_loop(cfg: Any) -> None:
 
     model = build_model_from_cfg(cfg)
     optimizer = build_optimizer(cfg, model)
+
     scheduler = None
     if str(_cfg_get(cfg, "train.scheduler", "cosine")).lower() == "cosine":
         scheduler = CosineAnnealingLR(
@@ -800,20 +875,15 @@ def train_loop(cfg: Any) -> None:
             f"Model params: total={pinfo['total']:,} trainable={pinfo['trainable']:,}"
         )
 
-    seg_loss_fn = DiceCELoss(sigmoid=True, squared_pred=False, reduction="mean")
-    cls_loss_fn = _build_cls_loss_fn(cfg, accelerator.device)
-
     epochs = int(_cfg_get(cfg, "train.epochs", 100))
+
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
-        stage = _get_stage(epoch, cfg)
-        stage_cfg = apply_stage_policy(model, accelerator, stage, cfg)
-        accelerator.wait_for_everyone()
 
-        # refresh optimizer param groups lr after stage changes
-        base_lr = float(_cfg_get(cfg, "train.lr", 1e-3))
-        for group in optimizer.param_groups:
-            group["lr"] = base_lr if group["lr"] >= base_lr * 0.5 else base_lr * 0.1
+        stage_cfg = _compute_curriculum_stage(epoch, cfg)
+        policy_info = apply_stage_policy(model, accelerator, stage_cfg, cfg)
+        _update_optimizer_lrs(optimizer, stage_cfg["stage"], cfg)
+        accelerator.wait_for_everyone()
 
         train_stats = run_one_epoch(
             split_name="train",
@@ -822,13 +892,12 @@ def train_loop(cfg: Any) -> None:
             model=model,
             data_loader=train_loader,
             optimizer=optimizer,
-            seg_loss_fn=seg_loss_fn,
-            cls_loss_fn=cls_loss_fn,
             epoch=epoch,
             stage_cfg=stage_cfg,
             cfg=cfg,
             run_dir=run_dir,
         )
+
         if scheduler is not None:
             scheduler.step()
 
@@ -839,8 +908,6 @@ def train_loop(cfg: Any) -> None:
             model=model,
             data_loader=val_loader,
             optimizer=None,
-            seg_loss_fn=seg_loss_fn,
-            cls_loss_fn=cls_loss_fn,
             epoch=epoch,
             stage_cfg=stage_cfg,
             cfg=cfg,
@@ -856,15 +923,14 @@ def train_loop(cfg: Any) -> None:
                 model=model,
                 data_loader=test_loader,
                 optimizer=None,
-                seg_loss_fn=seg_loss_fn,
-                cls_loss_fn=cls_loss_fn,
                 epoch=epoch,
                 stage_cfg=stage_cfg,
                 cfg=cfg,
                 run_dir=run_dir,
             )
 
-        score = _compute_monitor_score(val_stats, stage, cfg)
+        score = _compute_monitor_score(val_stats, cfg)
+
         save_latest_checkpoint(
             accelerator=accelerator,
             cfg=cfg,
@@ -873,6 +939,7 @@ def train_loop(cfg: Any) -> None:
             best_score=best_score,
             current_score=score,
         )
+
         best_score = save_best_weights_if_improved(
             accelerator=accelerator,
             model=model,
@@ -885,17 +952,20 @@ def train_loop(cfg: Any) -> None:
 
         if accelerator.is_main_process:
             dt = time.time() - t0
+            w = stage_cfg["weights"]
             msg = (
-                f"Epoch {epoch}/{epochs - 1} [{stage}] | trainable={stage_cfg['trainable_params']:,} | "
-                f"train: loss={train_stats['loss']:.4f} seg(dice={train_stats['seg_dice']:.4f}, hd95={train_stats['seg_hd95']:.3f}, miou={train_stats['seg_miou']:.4f}) "
-                f"cls(acc={train_stats['cls_acc']:.4f}, f1={train_stats['cls_f1']:.4f}, spec={train_stats['cls_specificity']:.4f}, rec={train_stats['cls_recall']:.4f}, miou={train_stats['cls_miou']:.4f}) | "
-                f"val: loss={val_stats['loss']:.4f} seg(dice={val_stats['seg_dice']:.4f}, hd95={val_stats['seg_hd95']:.3f}, miou={val_stats['seg_miou']:.4f}) "
-                f"cls(acc={val_stats['cls_acc']:.4f}, f1={val_stats['cls_f1']:.4f}, spec={val_stats['cls_specificity']:.4f}, rec={val_stats['cls_recall']:.4f}, miou={val_stats['cls_miou']:.4f})"
+                f"Epoch {epoch}/{epochs - 1} [{stage_cfg['stage']}] "
+                f"| trainable={policy_info['trainable_params']:,} "
+                f"| w(seg={w['seg']:.3f}, cls={w['cls']:.3f}, unc={w['unc']:.3f}, core={w['core']:.3f}, rim={w['rim']:.3f}) "
+                f"| train: loss={train_stats['loss']:.4f} seg(dice={train_stats['seg_dice']:.4f}, hd95={train_stats['seg_hd95']:.3f}, miou={train_stats['seg_miou']:.4f}) "
+                f"cls(acc={train_stats['cls_acc']:.4f}, f1={train_stats['cls_f1']:.4f}, spec={train_stats['cls_specificity']:.4f}, rec={train_stats['cls_recall']:.4f}) "
+                f"| val: loss={val_stats['loss']:.4f} seg(dice={val_stats['seg_dice']:.4f}, hd95={val_stats['seg_hd95']:.3f}, miou={val_stats['seg_miou']:.4f}) "
+                f"cls(acc={val_stats['cls_acc']:.4f}, f1={val_stats['cls_f1']:.4f}, spec={val_stats['cls_specificity']:.4f}, rec={val_stats['cls_recall']:.4f})"
             )
             if test_stats is not None:
                 msg += (
                     f" | test: loss={test_stats['loss']:.4f} seg(dice={test_stats['seg_dice']:.4f}, hd95={test_stats['seg_hd95']:.3f}, miou={test_stats['seg_miou']:.4f}) "
-                    f"cls(acc={test_stats['cls_acc']:.4f}, f1={test_stats['cls_f1']:.4f}, spec={test_stats['cls_specificity']:.4f}, rec={test_stats['cls_recall']:.4f}, miou={test_stats['cls_miou']:.4f})"
+                    f"cls(acc={test_stats['cls_acc']:.4f}, f1={test_stats['cls_f1']:.4f}, spec={test_stats['cls_specificity']:.4f}, rec={test_stats['cls_recall']:.4f})"
                 )
             msg += f" | best={best_score:.4f} | {dt:.1f}s"
             accelerator.print(msg)
